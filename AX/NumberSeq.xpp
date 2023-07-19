@@ -1,0 +1,3201 @@
+using Stopwatch = System.Diagnostics.Stopwatch;
+using Microsoft.Dynamics.Ax.Xpp.CloudAndEdge;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Dynamics.ApplicationPlatform.Flighting;
+
+/// <summary>
+/// This is the class that provides continuous number sequences.
+/// </summary>
+/// <remarks>
+/// Provides the base behavior of numbersequences by reserving numbers into the reserved list and returning the next number.
+/// </remarks>
+// This is a framework class. Customizing this class may cause problems with future upgrades to the software.
+public class NumberSeq implements SysPackable
+{
+    internal const str NonceName = "SysNumberSequenceNonce";
+
+    // The following fields can be directly  persisted to a container as they are primitive data types or tables.
+    refRecId                numberId;
+    refRecId                voucherId;
+    NumberSequenceCode      numberCode;
+    NumberSequenceCode      voucherCode;
+    boolean                 inBatch = false;
+
+    NumberSequenceReference refTableNum;
+    NumberSequenceReference refTableVoucher;
+
+    Integer                 nextrec;
+    Integer                 nextvoucher;
+    private NumberSequence64Range nextrec64;
+    private NumberSequence64Range nextvoucher64;
+
+    Num                     lastNumGenerated;
+    Voucher                 lastVoucherNumGenerated;
+
+    createdTransactionId    globalTransId;
+    boolean                 makeDecisionLater;
+    boolean                 active;
+    boolean                 doCreateTTSLink;
+    boolean                 sequenceUpdated;
+    boolean                 classEnd;
+    boolean                 ttsCreateRetryOk;
+    boolean                 forcedCopyOf;
+
+    NumberSequenceTable     numTableNum; // Packed directly via global::buf2con in the pack method.
+    NumberSequenceTable     numTableVoucher; // Packed directly via global::buf2con in the pack method.
+    private static SysInstrumentationLogger logger = SysInstrumentationLoggerFactory::CreateLogger("AX-CNSPerformance");
+    
+    // The following fields cannot be directly persisted to a container as they are an object type.
+    // -none-
+
+    #DEFINE.SymbolNumerals('#')
+    #DEFINE.SymbolLetters('&')
+    #DEFINE.FormattingSymbols('#&')
+    #DEFINE.NoOfLetters(26)
+    #DEFINE.FirstLetter('A')
+    #DEFINE.FirstLowcaseLetter('a')
+
+    #define.NextRecordNull(0)
+
+    #Define.AnnotatedFormatConstantSegment(-1)
+    #Define.AnnotatedFormatFormattingSegment(-2)
+    #Define.AnnotatedFormatDelimiter('\t')
+    #Define.AnnotatedFormatSegmentDelimiter('\n')
+    #Define.AnnotatedFormatSegment_TypeIndex(1)
+    #Define.AnnotatedFormatSegment_ValueIndex(2)
+
+
+    // This list defines how the object is serialized and unserialized as it is sent across the wire. This
+    // list should contain all non-object types defined on this class declaration.
+    #define.CurrentVersion(3)
+    #localmacro.CurrentList
+        numberId,
+        voucherId,
+        refTableNum,
+        refTableVoucher,
+        nextrec,
+        nextRec64,
+        lastNumGenerated,
+        nextvoucher,
+        nextVoucher64,
+        lastVoucherNumGenerated,
+        globalTransId,
+        makeDecisionLater,
+        active,
+        doCreateTTSLink,
+        sequenceUpdated,
+        classEnd,
+        ttsCreateRetryOk,
+        forcedCopyOf,
+        numberCode,
+        voucherCode
+    #endmacro				
+    public void abort()
+    {
+        if (!active)
+            return;
+
+        ttsbegin;
+
+        if (numberId && nextrec64 != #NextRecordNull && this.doCleanup(numberId))
+            NumberSeqGlobal::Instance().setAbortV2(numberId, nextrec64, numTableNum.mustRunCompleteCleanUp());
+
+
+        if (voucherId && nextvoucher64 != #NextRecordNull && this.doCleanup(voucherId))
+            NumberSeqGlobal::Instance().setAbortV2(voucherId, nextvoucher64, numTableVoucher.mustRunCompleteCleanUp());
+
+        ttscommit;
+
+        if (makeDecisionLater)
+            classEnd = true;
+    }
+
+    [DataEventHandler(tableStr(NumberSequenceDatatype), DataEventType::Updated),
+     DataEventHandler(tableStr(NumberSequenceDatatype), DataEventType::Inserted),
+     DataEventHandler(tableStr(NumberSequenceDatatype), DataEventType::Deleted),
+     DataEventHandler(tableStr(NumberSequenceReference), DataEventType::Updated),
+     DataEventHandler(tableStr(NumberSequenceReference), DataEventType::Inserted),
+     DataEventHandler(tableStr(NumberSequenceReference), DataEventType::Deleted),
+     DataEventHandler(tableStr(NumberSequenceTable), DataEventType::Inserted),
+     DataEventHandler(tableStr(NumberSequenceTable), DataEventType::Deleted),
+     Hookable(false)]
+    public static void handleNumberSequenceCUD(Common _buffer, DataEventArgs _eventArgs)
+    {
+        if (ScaleUnit::instance().isScaleUnitFeatureEnabled())
+        {
+            ILogger asILogger = NumberSeq::getSysLogger().getLogger();
+            NoncedCache::get_Singleton().Invalidate(NumberSeq::NonceName, asILogger);
+        }
+    }
+
+    private static boolean getNonBlockingNumberSequenceFlag(boolean reload=false)
+    {
+        return NumberSeqGlobal::GetNonBlockingNumberSequenceFlag();
+    }
+
+    public boolean checkSetup()
+    {
+        if (!numberId && !voucherId)
+            return checkFailed("@SYS26051");
+
+        if ((makeDecisionLater && active) || classEnd)
+            return checkFailed("@SYS26052");
+
+        return true;
+    }
+
+    protected boolean checkSetUpNum(NumberSequenceTable numberSequenceTable)
+    {
+        if (!numberSequenceTable.checkValid())
+            return false;
+
+        if (!makeDecisionLater && appl.ttsLevel() == 1 && !this.runNumberSequencesInMainConnection() && numberSequenceTable.Continuous == NoYes::Yes)
+            return checkFailed(strFmt("@SYS26203", numberSequenceTable.NumberSequence));
+
+        if (!numberSequenceTable.checkBlocked())
+            return false;
+
+        return true;
+    }
+
+    public boolean checkSetupReserve(NumberSequenceTable numberSequenceTable, Num numWithTemPlate)
+    {
+        NumberSequence64Range strippedNum;
+
+        if (!numberSequenceTable.checkValid())
+            throw error("@SYS25038");
+
+        if (!makeDecisionLater && appl.ttsLevel() == 1 && !this.runNumberSequencesInMainConnection() && numberSequenceTable.Continuous == NoYes::Yes)
+            return checkFailed(strFmt("@SYS26203", numberSequenceTable.NumberSequence));
+
+        if (numberSequenceTable.Manual)
+            return false;
+
+        if (!numberSequenceTable.checkBlocked())
+            return false;
+
+        if (!numberSequenceTable.AllowChangeDown && !numberSequenceTable.AllowChangeUp)
+            return checkFailed(strFmt("@SYS26078",numberSequenceTable.NumberSequence));
+
+        if (numberSequenceTable.Format && !NumberSeq::numCheckFormat(numWithTemPlate,numberSequenceTable))
+            return false;
+
+        if (numberSequenceTable.Extended)
+        {
+            strippedNum = NumberSeq::numRemoveFormatV2(numWithTemPlate, numberSequenceTable.Format);
+
+            if (NumberSeq::numInsertFormatV2(strippedNum,numberSequenceTable.Format) != numWithTemPlate)
+                return checkFailed(strFmt("@SYS75634",numWithTemPlate,numberSequenceTable.Format,numberSequenceTable.NumberSequence));
+        }
+        else
+        {
+            strippedNum = NumberSeq::numRemoveFormat(numWithTemPlate, numberSequenceTable.Format);
+
+            if (NumberSeq::numInsertFormat(strippedNum,numberSequenceTable.Format) != numWithTemPlate)
+                return checkFailed(strFmt("@SYS75634",numWithTemPlate,numberSequenceTable.Format,numberSequenceTable.NumberSequence));
+        }
+
+        if (strippedNum > numberSequenceTable.effectiveNextRec() && !numberSequenceTable.AllowChangeUp)
+            return checkFailed(strFmt("@SYS70845",numberSequenceTable.NumberSequence));
+
+        if (strippedNum < numberSequenceTable.effectiveNextRec() && !numberSequenceTable.AllowChangeDown)
+            return checkFailed(strFmt("@SYS70844",numberSequenceTable.NumberSequence));
+
+        if (strippedNum > numberSequenceTable.effectiveHighest())
+            return checkFailed(strFmt("@SYS26081",numWithTemPlate,numberSequenceTable.NumberSequence));
+
+        if (strippedNum < numberSequenceTable.effectiveLowest())
+            return checkFailed(strFmt("@SYS53721",numWithTemPlate,numberSequenceTable.NumberSequence));
+
+        return true;
+    }
+
+    protected void createTTSLink(boolean doRetry = false)
+    {
+        NumberSequenceTTS numberSequenceTTS;
+
+        if (!active && makeDecisionLater && !doRetry)
+            return;
+
+        if (doCreateTTSLink)
+        {
+            ttsbegin;
+            numberSequenceTTS.TransId = globalTransId;
+            numberSequenceTTS.insert();
+            ttscommit;
+        }
+    }
+
+    protected boolean doCleanup(RefRecId _numberSequenceId)
+    {
+        if (numTableNum.RecId == _numberSequenceId)
+            return numTableNum.Continuous;
+
+        if (numTableVoucher.RecId == _numberSequenceId)
+            return numTableVoucher.Continuous;
+
+        return false;
+    }
+
+    /// <summary>
+    ///    Formats the last number member variable.
+    /// </summary>
+    /// <param name="_format">
+    ///    The record to format.
+    /// </param>
+    /// <param name="_nextRecord">
+    ///    The value before formatting.
+    /// </param>
+    /// <param name="_voucher">
+    ///    A Boolean value to indicate the type of request, if true then format the vendor value.
+    /// </param>
+    protected void formatLastNumber(NumberSequenceFormat _format, Integer _nextRecord, boolean _voucher)
+    {
+        if (_voucher)
+        {
+            lastVoucherNumGenerated = NumberSeq::numInsertFormat(_nextRecord, _format);
+        }
+        else
+        {
+            lastNumGenerated = NumberSeq::numInsertFormat(_nextRecord, _format);
+        }
+    }
+
+    /// <summary>
+    ///    Formats the last number member variable.
+    /// </summary>
+    /// <param name="_format">
+    ///    The record to format.
+    /// </param>
+    /// <param name="_nextRecord">
+    ///    The value before formatting.
+    /// </param>
+    /// <param name="_voucher">
+    ///    A Boolean value to indicate the type of request, if true then format the vendor value.
+    /// </param>
+    protected void formatLastNumberV2(NumberSequenceFormat _format, NumberSequence64Range _nextRecord, boolean _voucher)
+    {
+        if (_voucher)
+        {
+            lastVoucherNumGenerated = NumberSeq::numInsertFormatV2(_nextRecord, _format);
+        }
+        else
+        {
+            lastNumGenerated = NumberSeq::numInsertFormatV2(_nextRecord, _format);
+        }
+    }
+
+    [SysObsolete('Please use getNumFromListV2 instead', false,  30\6\2020)]
+    protected Integer getNumFromList(
+        NumberSequenceConnection    userConnection,
+        NumberSequenceTable         numberSequenceTable)
+    {
+        return int642int(this.getNumFromListV2(userConnection, numberSequenceTable));
+    }
+
+    /// <summary>
+    ///    Obtains a number from the returned reserved list.
+    /// </summary>
+    /// <param name="userConnection">
+    ///    The <c>userConnection</c> to use must be separate from the application transaction.
+    /// </param>
+    /// <param name="numberSequenceTable">
+    ///    The table with the number sequence selected for this request.
+    /// </param>
+    /// <returns>
+    ///    The number that is found, or <c>#NextRecordNull</c> to indicate that there is no number to use.
+    /// </returns>
+    protected NumberSequence64Range getNumFromListV2(
+        NumberSequenceConnection    userConnection,
+        NumberSequenceTable         numberSequenceTable)
+    {
+        NumberSequence64Range nextRecord = #NextRecordNull;
+                
+        if (!numberSequenceTable.Continuous) // Continuous are the only ones that benefit from stored procedure based on tests.
+        {
+            return nextRecord;
+        }
+
+        boolean nonBlockingNumberSequenceFlagEnabledToUse = NumberSeq::getNonBlockingNumberSequenceFlag();
+
+        if (this.runNumberSequencesInMainConnection() /* && (!NumberSeqGlobal::parmAllowOptimizedCNSFlowForTest()) */)
+        {
+            // main connection mode only supports "getNumFromTable" model
+            if (numberSequenceTable.Extended)
+            {
+                nextRecord = this.getNumFromTableV2(userConnection, numberSequenceTable);
+            }
+            else
+            {
+                nextRecord = this.getNumFromTable(userConnection, numberSequenceTable);
+            }
+        }
+        else
+        {
+            var xSession = new xSession(sessionId());
+            var sessionId = xSession.sessionId();
+            var sessionLoginDateTime = xSession.loginDateTime();
+            var numberSequenceId = numberSequenceTable.RecId;
+            var stopwatch = StopWatch::StartNew();
+    
+            try
+            {
+                RefRecId numberSequenceDeploymentRecId = xApplication::multipleDeploymentsExist() ? NumberSequenceDeployment::findActiveNumberSequenceDeployment(numberSequenceTable.RecId).RecId : 0;
+                if (nonBlockingNumberSequenceFlagEnabledToUse)
+                {
+                    var activity = SysInstrumentationActivity::construct("NumberSeq::getNumFromListv2", "AX-NumberSequence");
+                    using (SysInstrumentationActivityContext context = logger.activityContextWithCustomProperties(activity))
+                    {
+                        context.addCustomProperty("numberSequenceId", any2Str(numberSequenceId));
+                        context.addCustomProperty("makeDecisionLater", any2Str(makeDecisionLater));
+                        context.addCustomProperty("sessionId", any2Str(sessionId));
+                        context.addCustomProperty("sessionLoginDateTime", any2Str(sessionLoginDateTime));
+                        context.addCustomProperty("numberSequenceDeploymentRecId", any2Str(numberSequenceDeploymentRecId));
+
+                        nextRecord = NumberSequence::getNextNumberWithNonBlocking(userConnection.getInternalConnection(),
+                        numberSequenceId,
+                        makeDecisionLater ? 0 : globalTransId,
+                        curUserId(),
+                        sessionId,
+                        sessionLoginDateTime,
+                        numberSequenceDeploymentRecId);
+                    
+                        context.addCustomProperty("nextRecord", any2Str(nextRecord));
+                    }
+                }
+                else
+                {
+                    nextRecord = NumberSequence::getNextNumberV2(userConnection.getInternalConnection(),
+                    numberSequenceId,
+                    makeDecisionLater ? 0 : globalTransId,
+                    curUserId(),
+                    sessionId,
+                    sessionLoginDateTime,
+                    numberSequenceDeploymentRecId);
+                }
+            }
+            finally
+            {
+                stopwatch.Stop();
+                var successful = nextRecord != #NextRecordNull;
+
+                RecId numberSequenceListId = 0;
+                if (successful && !nonBlockingNumberSequenceFlagEnabledToUse)
+                {
+                    NumberSequenceList numberSequenceList;
+                    userConnection.setConnection(numberSequenceList);
+                    select firstonly numberSequenceList
+                    where numberSequenceList.NumberSequenceId == numberSequenceId
+                          && (numberSequenceList.NextRec == nextRecord || numberSequenceList.NextRec64 == nextRecord);
+                    numberSequenceListId = numberSequenceList.RecId;
+                }
+                
+                NumberSeqInstrumentationHelper::emitDrawNumberFromStoredProc(
+                    numberSequenceId,
+                    numberSequenceListId,
+                    sessionId,
+                    sessionLoginDateTime,
+                    successful,
+                    stopwatch,
+                    nextRecord);
+            }
+        }
+
+        return nextRecord;
+    }
+
+    /// <summary>
+    ///     Gets whether number sequences need to execute against the main connection.
+    /// </summary>
+    /// <returns>true if main connection is used; false if a user connection is used.</returns>
+    protected boolean runNumberSequencesInMainConnection()
+    {
+        return NumberSequenceConnection::willAutoRollback() || NumberSeqGlobal::Instance().parmSessionAllowsAutomaticNumberSequenceGeneration();
+    }
+
+    [SysObsolete('Please use getNumFromTableV2 instead', false, 30\6\2020)]
+    protected Integer getNumFromTable(
+        NumberSequenceConnection    userConnection,
+        NumberSequenceTable         numberSequenceTable)
+    {
+        return int642int(this.getNumFromTableV2(userConnection, numberSequenceTable));
+    }
+
+    /// <summary>
+    ///    Reads the next number from the <c>NumberSequencesTable</c> table.
+    /// </summary>
+    /// <param name="userConnection">
+    ///    The operation must be separate from the application transaction. Therefore, a user connection is
+    ///    required.
+    /// </param>
+    /// <param name="numberSequenceTable">
+    ///    The table with the record sequence selected that indicates the operation parameters and the next
+    ///    records.
+    /// </param>
+    /// <returns>
+    ///    The next record number that is available.
+    /// </returns>
+    /// <remarks>
+    ///    The number is also reserved into the <c>NumberSequenceList</c> class.
+    /// </remarks>
+    protected NumberSequence64Range getNumFromTableV2(
+        NumberSequenceConnection    userConnection,
+        NumberSequenceTable         numberSequenceTable)
+    {
+        NumberSequence64Range nextRecord = #NextRecordNull;
+        NumberSequenceList numberSequenceList;
+        var stopwatch = Stopwatch::StartNew();
+
+        try
+        {
+            Integer increment   = 1;
+            if (numberSequenceTable.AllowChangeUp)
+                increment += this.reservationFindIncrement(userConnection,numberSequenceTable);
+
+            nextRecord = (numberSequenceTable.effectiveNextRec() + increment - 1);
+
+            if (nextRecord > numberSequenceTable.effectiveHighest())
+            {
+                throw error(strFmt("@SYS17478", numberSequenceTable.NumberSequence));
+            }
+
+            userConnection.setConnection(numberSequenceList);
+            numberSequenceList.NumberSequenceId  = numberSequenceTable.RecId;
+            numberSequenceList.TransId           = makeDecisionLater ? 0 : globalTransId;
+            numberSequenceList.Status            = NumStatus::Active;
+            if (numberSequenceTable.Extended)
+            {
+                numberSequenceList.NextRec64 = nextRecord;
+            }
+            else
+            {
+                numberSequenceList.NextRec = int642int(nextRecord);
+            }
+            numberSequenceList.insert();
+
+            sequenceUpdated = true;
+
+            if (numberSequenceTable.InUse == NoYes::No)
+            {
+                numberSequenceTable.InUse = NoYes::Yes;
+            }
+
+            if (numberSequenceTable.Extended)
+            {
+                numberSequenceTable.NextRec64 += increment;
+            }
+            else
+            {
+                numberSequenceTable.NextRec += increment;
+            }
+
+            numberSequenceTable.update();
+        }
+        finally
+        {
+            stopwatch.Stop();
+            var successful = nextRecord != #NextRecordNull;
+            NumberSeqInstrumentationHelper::emitDrawNumberFromTable(
+                numberSequenceList.NumberSequenceId,
+                numberSequenceList.RecId,
+                numberSequenceList.SessionId,
+                numberSequenceList.SessionLoginDateTime,
+                successful,
+                stopwatch,
+                nextRecord);
+        }
+
+        return nextRecord;
+    }
+
+    [SysObsolete('Please use getNumInternalV2 instead', false, 30\6\2020)]
+    protected Integer getNumInternal(RefRecId _numberSequenceId, boolean _voucher)
+    {
+        return int642int(this.getNumInternalV2(_numberSequenceId, _voucher));
+    }
+
+    protected NumberSequence64Range getNumInternalV2(RefRecId _numberSequenceId, boolean _voucher)
+    {
+        NumberSequenceTable numberSequenceTable;
+        NumberSequence64Range nextRecord;
+        boolean numTableValue = false;
+  
+        this.setGlobalTransId();
+
+        boolean nonBlockingNumberSequenceFlagEnabledToUse = NumberSeq::getNonBlockingNumberSequenceFlag();
+
+        using (NumberSequenceConnection userConnection = NumberSequenceConnection::newEnsureDisposedBeforeTTSFinalization())
+        {
+            userConnection.tts_begin();
+
+            sequenceUpdated = false;
+
+            userConnection.setConnection(numberSequenceTable);
+
+            if (nonBlockingNumberSequenceFlagEnabledToUse)
+             {
+                select firstonly numberSequenceTable
+                where numberSequenceTable.RecId == _numberSequenceId;
+                numTableValue = true;
+             }
+            if( !numTableValue || (numTableValue && !numberSequenceTable.Continuous) )
+            {
+                select forupdate firstonly numberSequenceTable
+                where numberSequenceTable.RecId == _numberSequenceId;
+            }
+
+            this.setCleanupSequence(numberSequenceTable);
+
+            boolean ok = this.checkSetUpNum(numberSequenceTable);
+            if (ok)
+            {
+                var activity = SysInstrumentationActivity::construct("NumberSeq::getNumInternalV2", "AX-NumberSequence");
+                using (SysInstrumentationActivityContext context = logger.activityContextWithCustomProperties(activity))
+                {
+                    if (numberSequenceTable.Extended)
+                    {
+                        nextRecord = this.getNumFromListV2(userConnection, numberSequenceTable);
+                    }
+                    else
+                    {
+                        nextRecord = this.getNumFromList(userConnection, numberSequenceTable);
+                    }
+                }
+
+                if (nextRecord == #NextRecordNull)
+                {
+                    if (numberSequenceTable.effectiveNextRec() == 0 || numberSequenceTable.effectiveNextRec() > numberSequenceTable.effectiveHighest())
+                    {
+                        ok = checkFailed(strFmt("@SYS17478", numberSequenceTable.NumberSequence));
+                    }
+                    else
+                    {
+                        if (!numberSequenceTable.Continuous)
+                        {
+                            if (numberSequenceTable.Extended)
+                            {
+                                nextRecord = this.getNumFromTableV2(userConnection, numberSequenceTable);
+                            }
+                            else
+                            {
+                                nextRecord = this.getNumFromTable(userConnection, numberSequenceTable);
+                            }
+                        }
+                    }
+                  }
+                else
+                {
+                    sequenceUpdated = true;
+                }
+            }
+
+            if (!ok)
+            {
+                userConnection.tts_abort();
+                throw error("@SYS25038");
+            }
+
+            userConnection.tts_commit();
+        }
+
+        if (numberSequenceTable.Extended)
+        {
+            this.formatLastNumberV2(numberSequenceTable.Format, nextRecord, _voucher);
+        }
+        else
+        {
+            this.formatLastNumber(numberSequenceTable.Format, int642int(nextRecord), _voucher);
+        }
+
+        if (sequenceUpdated)
+            this.createTTSLink();
+
+        return nextRecord;
+    }
+
+    /// <summary>
+    ///    Accesses the last formatted number that was generated.
+    /// </summary>
+    /// <returns>
+    ///    The last number generated.
+    /// </returns>
+    /// <remarks>
+    ///    Returns an empty string fro manual numbers. Some implementers of this class override internal
+    ///    behavior, such as the <c>getNumInternal</c> method.
+    /// </remarks>
+    protected Num lastNum()
+    {
+        if (!numberId || voucherId)
+            throw error("@SYS26051");
+
+        if (numTableNum.Manual)
+        {
+            nextrec = #NextRecordNull;
+            nextrec64 = #NextRecordNull;
+            lastNumGenerated = '';
+        }
+
+        return lastNumGenerated;
+    }
+
+    private static SysInstrumentationLogger getSysLogger()
+    {
+        if (NumberSeq::logger == null)
+        {
+            NumberSeq::logger = SysInstrumentationLoggerFactory::CreateLogger(classStr(NumberSeq));
+        }
+
+        return NumberSeq::logger;
+    }
+
+    public void new()
+    {
+        active              = false;
+        classEnd            = false;
+        ttsCreateRetryOk    = false;
+        globalTransId       = 0;
+        nextrec             = #NextRecordNull;
+        nextrec64           = #NextRecordNull;
+        nextvoucher         = #NextRecordNull;
+        nextvoucher64       = #NextRecordNull;
+        lastNumGenerated = '';
+        lastVoucherNumGenerated = '';
+    }
+
+    /// <summary>
+    ///    Generates and retrieves the next number in a single call.
+    /// </summary>
+    /// <returns>
+    ///    The formatted value of the last number generated for non voucher numbers.
+    /// </returns>
+    public Num num()
+    {
+        if (!numberId || voucherId)
+            throw error("@SYS26051");
+
+        if (numTableNum.Manual)
+        {
+            nextrec = #NextRecordNull;
+            nextrec64 = #NextRecordNull;
+            lastNumGenerated = '';
+        }
+        else
+            this.runNumber();
+
+        return lastNumGenerated;
+    }
+
+    /// <summary>
+    ///    Generates the bulk numbers to get numbers with non blocking.
+    /// </summary>
+    public void prePopulateNumbers(int64 quantity)
+    {
+        boolean nonBlockingNumberSequenceFlagEnabledToUse = NumberSeq::getNonBlockingNumberSequenceFlag();
+
+        if (nonBlockingNumberSequenceFlagEnabledToUse)
+        {
+            using (NumberSequenceConnection userConnection = NumberSequenceConnection::construct())
+            {
+                if(numberId)
+                {
+                    NumberSequence:: prePopulateNumbers(userConnection.getInternalConnection(), numberId, quantity);
+                }
+                else if(voucherId)
+                {
+                    NumberSequence:: prePopulateNumbers(userConnection.getInternalConnection(), voucherId, quantity);
+                }
+                if(numberId && voucherId)
+                {
+                    NumberSequenceDatatype numberDatatype;
+                    NumberSequenceDatatype voucherDatatype;
+
+                    if (refTableNum.RecId && refTableVoucher.RecId)
+                    {
+                        numberDatatype = NumberSequenceDatatype::find(refTableNum.NumberSequenceDatatype);
+                        voucherDatatype = NumberSequenceDatatype::find(refTableVoucher.NumberSequenceDatatype);
+                    }
+                    boolean isSameNumberAndVoucher = (forcedCopyOf  || (refTableNum   && refTableVoucher  && refTableVoucher.AllowSameAs && voucherDatatype.DataTypeSameAsId == numberDatatype.DatatypeId));
+
+                    if(!isSameNumberAndVoucher)
+                    {
+                        NumberSequence:: prePopulateNumbers(userConnection.getInternalConnection(), voucherId, quantity);
+                    }
+                }
+            }
+        }
+       else
+        {
+            throw error("@SYS25067");
+        }
+    }
+
+    public container numAndVoucher()
+    {
+        if (!numberId || !voucherId)
+            throw error("@SYS26051");
+
+        if (NumberSequenceTable::find(numberId).Manual || NumberSequenceTable::find(voucherId).Manual)
+        {
+            nextrec = #NextRecordNull;
+            nextrec64 = #NextRecordNull;
+            lastNumGenerated  = '';
+            nextvoucher = #NextRecordNull;
+            nextvoucher64 = #NextRecordNull;
+            lastVoucherNumGenerated = '';
+        }
+        else
+            this.runNumber();
+
+        return [lastNumGenerated,lastVoucherNumGenerated];
+    }
+
+    public container pack()
+    {
+        ;
+
+        // Pack all class member variables for serialization. The table buffers numTableNum and
+        // numTableVoucher are packed using buf2con so that no cursor-specific information is
+        // stored.
+        return [#CurrentVersion, [#CurrentList, numTableNum.buf2con(), numTableVoucher.buf2con()]];
+    }
+
+    public boolean parmForcedCopyOf(boolean _forcedCopyOf)
+    {
+        if (active)
+            throw error("@SYS25067");
+
+        forcedCopyOf = _forcedCopyOf;
+        return forcedCopyOf;
+    }
+
+    public boolean parmMakeDecisionLater(boolean _makeDecisionLater)
+    {
+        if (active)
+            throw error("@SYS25067");
+
+        makeDecisionLater = _makeDecisionLater;
+        return makeDecisionLater;
+    }
+
+    public NumberSequenceCode parmNumberSequenceCode(NumberSequenceCode _numberCode = numberCode)
+    {
+        if (active && _numberCode != numberCode)
+            throw error("@SYS25067");
+
+        numberCode = _numberCode;
+        return numberCode;
+    }
+
+    public RefRecId parmNumberSequenceId(RefRecId _numberSequenceId = numberId)
+    {
+        if (active && _numberSequenceId != numberId)
+            throw error("@SYS25067");
+
+        numberId = _numberSequenceId;
+        return numberId;
+    }
+
+    public NumberSequenceTable parmNumTableNum(NumberSequenceTable _numTableNum)
+    {
+        if (_numTableNum)
+            numTableNum = _numTableNum.data();
+        return numTableNum;
+    }
+
+    public NumberSequenceTable parmNumTableVoucher(NumberSequenceTable _numTableVoucher)
+    {
+        if (_numTableVoucher)
+            numTableVoucher = _numTableVoucher.data();
+        return numTableVoucher;
+    }
+
+    public NumberSequenceReference parmRefTableNum(NumberSequenceReference _refTableNum)
+    {
+        if (_refTableNum)
+            refTableNum = _refTableNum.data();
+        return refTableNum;
+    }
+
+    public NumberSequenceReference parmRefTableVoucher(NumberSequenceReference _refTableVoucher)
+    {
+        if (_refTableVoucher)
+            refTableVoucher = _refTableVoucher.data();
+        return refTableVoucher;
+    }
+
+    public NumberSequenceCode parmVoucherSequenceCode(NumberSequenceCode _voucherCode = voucherCode)
+    {
+        if (active && _voucherCode != voucherCode)
+            throw error("@SYS25067");
+
+        voucherCode = _voucherCode;
+        return voucherCode;
+    }
+
+    public RefRecId parmVoucherSequenceId(RefRecId _voucherSequenceId = voucherId)
+    {
+        if (active && _voucherSequenceId != voucherId)
+            throw error("@SYS25067");
+
+        voucherId = _voucherSequenceId;
+        return voucherId;
+    }
+
+    protected Integer reservationFindIncrement(NumberSequenceConnection       userConnection,
+                                               NumberSequenceTable  numberSequenceTable
+                                              )
+    {
+        NumberSequenceList  numberSequenceListReserve;
+        Integer             countIncrement = 0;
+        NumberSequence64Range nextRecord;
+
+        boolean isNumReserved(NumberSequence64Range reserveNum)
+        {
+            select forupdate firstonly numberSequenceListReserve
+                where numberSequenceListReserve.NumberSequenceId == numberSequenceTable.RecId
+                      && (numberSequenceListReserve.NextRec == reserveNum || numberSequenceListReserve.NextRec64 == reserveNum)
+                      && numberSequenceListReserve.Status == NumStatus::Reserved;
+
+            return numberSequenceListReserve.RecId ? true : false;
+        }
+
+        userConnection.setConnection(numberSequenceListReserve);
+
+        nextRecord = numberSequenceTable.effectiveNextRec();
+        
+        while (true)
+        {
+            if (isNumReserved(nextRecord))
+                nextRecord += 1;
+            else
+                return int642int(nextRecord - numberSequenceTable.effectiveNextRec());
+
+            if (nextRecord > numberSequenceTable.effectiveHighest())
+                throw error(strFmt("@SYS17478",numberSequenceTable.NumberSequence));
+        }
+        return 0; // never gets here
+    }
+
+    public boolean reserve(Num _num)
+    {
+        return this.runReserve(_num);
+    }
+
+    protected boolean reserveNumInternal(RefRecId _numberSequenceId, Num _numWithTemplate)
+    {
+        #OCCRetryCount
+
+        NumberSequenceList      numberSequenceList;
+        NumberSequenceTable     numberSequenceTable;
+        boolean                 ok = false;
+        NumberSequence64Range   nextRecord = #NextRecordNull;
+        int retryCount = 0;
+        Num                     savedLastNumGenerated = lastNumGenerated;
+        Voucher                 savedLastVoucherNumGenerated = lastVoucherNumGenerated;
+        ;
+        this.setGlobalTransId();
+
+        using (NumberSequenceConnection userConnection = NumberSequenceConnection::newEnsureDisposedBeforeTTSFinalization())
+        {
+            userConnection.tts_begin();
+
+            sequenceUpdated = false;
+
+            userConnection.setConnection(numberSequenceList);
+            userConnection.setConnection(numberSequenceTable);
+
+            select forupdate firstonly numberSequenceTable
+            where numberSequenceTable.RecId == _numberSequenceId;
+
+            this.setCleanupSequence(numberSequenceTable);
+
+            if (this.checkSetupReserve(numberSequenceTable,_numWithTemplate))
+            {
+                if (numberSequenceTable.Extended)
+                {
+                    nextRecord = NumberSeq::numRemoveFormatV2(_numWithTemplate, numberSequenceTable.Format);
+                }
+                else
+                {
+                    nextRecord = NumberSeq::numRemoveFormat(_numWithTemplate, numberSequenceTable.Format);
+                }
+
+                try
+                {
+                    select forupdate firstonly numberSequenceList
+                    where numberSequenceList.NumberSequenceId == _numberSequenceId
+                          && (numberSequenceList.NextRec == nextRecord || numberSequenceList.NextRec64 == nextRecord);
+
+                    if (numberSequenceList.RecId && numberSequenceList.Status == NumStatus::Free)
+                    {
+                        ok = true;
+                        if (numberId)
+                        {
+                            lastNumGenerated = _numWithTemplate;
+                            nextrec64 = nextRecord;
+
+                            if (!numberSequenceTable.Extended)
+                            {
+                                nextrec = int642int(nextRecord);
+                            }
+                        }
+                        else
+                        {
+                            lastVoucherNumGenerated = _numWithTemplate;
+                            nextvoucher64 = nextRecord;
+
+                            if (!numberSequenceTable.Extended)
+                            {
+                                nextvoucher = int642int(nextRecord);
+                            }
+                        }
+
+                        numberSequenceList.Status    = NumStatus::Active;
+                        numberSequenceList.TransId   = makeDecisionLater ? 0 : globalTransId;
+                        numberSequenceList.update();
+
+                        sequenceUpdated = true;
+                    }
+                    else
+                    {
+                        if (numberSequenceList.RecId && numberSequenceList.Status == NumStatus::Reserved)
+                            ok  = false;
+                        else if (nextRecord < numberSequenceTable.effectiveNextRec())
+                            ok  = true;
+                        else
+                        {
+                            ok = true;
+
+                            if (numberId)
+                            {
+                                lastNumGenerated = _numWithTemplate;
+                                nextrec64 = nextRecord;
+
+                                if (!numberSequenceTable.Extended)
+                                {
+                                    nextrec = int642int(nextRecord);
+                                }
+                            }
+                            else
+                            {
+                                lastVoucherNumGenerated = _numWithTemplate;
+                                nextvoucher64 = nextRecord;
+
+                                if (!numberSequenceTable.Extended)
+                                {
+                                    nextvoucher = int642int(nextRecord);
+                                }
+                            }
+
+                            numberSequenceList.NumberSequenceId    = _numberSequenceId;
+                            numberSequenceList.TransId           = makeDecisionLater ? 0 : globalTransId;
+                            numberSequenceList.Status            = NumStatus::Reserved;
+
+                            if (numberSequenceTable.Extended)
+                            {
+                                numberSequenceList.NextRec64 = nextRecord;
+                            }
+                            else
+                            {
+                                numberSequenceList.NextRec = int642int(nextRecord);
+                            }
+
+                            numberSequenceList.insert();
+
+                            sequenceUpdated = true;
+                        }
+                    }
+                }
+                catch(Exception::UpdateConflict)
+                {
+                    // reset state.
+                    ok = false;
+                    lastNumGenerated = savedLastNumGenerated;
+                    lastVoucherNumGenerated = savedLastVoucherNumGenerated;
+
+                    retryCount++;
+                    if (retryCount >= #RetryNum)
+                    {
+                        userConnection.tts_abort();
+                        userConnection.finalize();
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+
+                if (numberSequenceTable.InUse == NoYes::No && ok)
+                {
+                    numberSequenceTable.InUse = NoYes::Yes;
+                    numberSequenceTable.update();
+                }
+            }
+            userConnection.tts_commit();
+        }
+
+        if (sequenceUpdated)
+            this.createTTSLink();
+
+        return ok;
+    }
+
+    protected void runNumber()
+    {
+        using (var instrumentation = new NumberSeqGetNumberInstrumentation(numberId, voucherId))
+        {
+            if (!this.checkSetup())
+            {
+                throw error("@SYS18447");
+            }
+
+            ttsbegin;
+
+            NumberSequenceTable numberSequenceTable;
+            
+            instrumentation.makeDecisionLater(makeDecisionLater);
+
+            if (numberId)
+            {
+                var activity = SysInstrumentationActivity::construct("NumberSeq::runNumber-numberId", "AX-NumberSequence");
+                using (SysInstrumentationActivityContext context = logger.activityContextWithCustomProperties(activity))
+                {
+                    context.addCustomProperty("numberId", any2Str(numberId));
+                    select firstonly numberSequenceTable
+                        where numberSequenceTable.RecId == numberId;
+                    if (numberSequenceTable.Extended)
+                    {
+                        nextrec64 = this.getNumInternalV2(numberId, false);
+                    }
+                    else
+                    {
+                        nextrec = this.getNumInternal(numberId, false);
+                        nextrec64 = nextrec;
+                    }
+                    context.addCustomProperty("nextrec", any2Str(nextrec64));
+                }
+
+                instrumentation.nextRec(nextrec64);
+            }
+            else if (voucherId)
+            {
+                var activity = SysInstrumentationActivity::construct("NumberSeq::runNumber-voucherId", "AX-NumberSequence");
+                using (SysInstrumentationActivityContext context = logger.activityContextWithCustomProperties(activity))
+                {
+                    context.addCustomProperty("voucherId", any2Str(voucherId));
+                    select firstonly numberSequenceTable
+                        where numberSequenceTable.RecId == voucherId;
+                    if (numberSequenceTable.Extended)
+                    { 
+                        nextvoucher64 = this.getNumInternalV2(voucherId, true);
+                    }
+                    else
+                    {
+                        nextvoucher = this.getNumInternal(voucherId, true);
+                        nextvoucher64 = nextvoucher;
+                    }
+                    context.addCustomProperty("nextvoucher", any2Str(nextvoucher64));
+                }
+
+                instrumentation.nextVoucher(nextvoucher64);
+            }
+
+            if (numberId && voucherId)
+            {
+                NumberSequenceDatatype numberDatatype;
+                NumberSequenceDatatype voucherDatatype;
+
+                if (refTableNum.RecId && refTableVoucher.RecId)
+                {
+                    numberDatatype = NumberSequenceDatatype::find(refTableNum.NumberSequenceDatatype);
+                    voucherDatatype = NumberSequenceDatatype::find(refTableVoucher.NumberSequenceDatatype);
+                }
+                if (forcedCopyOf                    ||
+                    (refTableNum                    &&
+                     refTableVoucher                &&
+                     refTableVoucher.AllowSameAs    &&
+                     voucherDatatype.DataTypeSameAsId == numberDatatype.DatatypeId
+                )
+               )
+                {
+                    voucherId = numberId;
+                    lastVoucherNumGenerated = lastNumGenerated;
+                    nextvoucher64 = nextrec64;
+                    nextvoucher = nextrec;
+                }
+                else
+                {
+                    select firstonly numberSequenceTable
+                        where numberSequenceTable.RecId == voucherId;
+                    if (numberSequenceTable.Extended)
+                    {
+                        nextvoucher64 = this.getNumInternalV2(voucherId, true);
+                    }
+                    else
+                    {
+                        nextvoucher = this.getNumInternal(voucherId, true);
+                        nextvoucher64 = nextvoucher;
+                    }
+                }
+            }
+            ttscommit;
+
+            active = true;
+        }
+    }
+
+    protected boolean runReserve(Num _num)
+    {
+        boolean ok = false;
+
+        if (!this.checkSetup())
+            throw error("@SYS18447");
+
+        if (numberId && voucherId)
+        {
+            checkFailed(strFmt("@SYS26077",numberId ? numberId : voucherId));
+            throw error("@SYS26275");
+        }
+        ttsbegin;
+
+        if (this.reserveNumInternal(numberId ? numberId : voucherId,_num))
+            ok = true;
+
+        ttscommit;
+
+        active = true;
+
+        return ok;
+
+    }
+
+    public void setCleanupSequence(NumberSequenceTable _numberSequenceTable)
+    {
+        if (!makeDecisionLater && this.doCleanup(_numberSequenceTable.RecId))
+            NumberSeqGlobal::Instance().setClean(_numberSequenceTable.RecId,globalTransId,_numberSequenceTable.mustRunCompleteCleanUp());
+    }
+
+    protected void setGlobalTransId()
+    {
+        CreatedTransactionId        saveGlobalTransId;
+        ;
+        doCreateTTSLink = false;
+
+        if (!globalTransId)
+        {
+            globalTransId   = appl.curTransactionId(true);
+            doCreateTTSLink = true;
+        }
+        else
+        {
+            saveGlobalTransId   =  globalTransId;
+            globalTransId       =  appl.curTransactionId(true);
+            doCreateTTSLink     =  globalTransId != saveGlobalTransId ? true : false;
+        }
+    }
+
+    public boolean unpack(container _packedClass)
+    {
+        Version version = RunBase::getVersion(_packedClass);
+        container packedValues, packedNumTableNum, packedNumTableVoucher;
+        ;
+
+        switch (version)
+        {
+            case #CurrentVersion:
+
+                // Extract the packed values.
+                [version, packedValues] = _packedClass;
+
+                // Extract the #CurrentList and packed table buffers.
+                [#CurrentList, packedNumTableNum, packedNumTableVoucher] = packedValues;
+
+                break;
+
+            default:
+                return false;
+        }
+
+        if (packedNumTableNum)
+        {
+            // Unpack the packed table.
+            numTableNum.con2buf(packedNumTableNum);
+        }
+
+        if (packedNumTableVoucher)
+        {
+            // Unpack the packed table.
+            numTableVoucher.con2buf(packedNumTableVoucher);
+        }
+
+        return true;
+    }
+
+    [SysObsolete('Will use BatchHeader methods to determine a batch call', false, 01\4\2022)]
+    public void setInBatch(boolean isBatchProcess)
+    {
+        inBatch = isBatchProcess;
+        return;
+    }
+
+    public void used()
+    {
+        NumberSeqInstrumentationHelper::emitNumberUsed(numberId, voucherId, nextrec64, nextvoucher64);
+
+        if (active && makeDecisionLater)
+        {
+            this.useNumInternal();
+            this.createTTSLink();
+            active      = false;
+
+            if (numberId && nextrec64 != #NextRecordNull && this.doCleanup(numberId))
+                NumberSeqGlobal::Instance().setClean(numberId,globalTransId,numTableNum.mustRunCompleteCleanUp());
+
+            if (voucherId && nextvoucher64 != #NextRecordNull && this.doCleanup(voucherId))
+                NumberSeqGlobal::Instance().setClean(voucherId,globalTransId,numTableVoucher.mustRunCompleteCleanUp());
+
+            lastNumGenerated = '';
+            nextrec = #NextRecordNull;
+            nextrec64 = #NextRecordNull;
+            nextvoucher = #NextRecordNull;
+            nextvoucher64 = #NextRecordNull;
+            lastVoucherNumGenerated  = '';
+            classEnd    = true;
+        }
+        else if (ttsCreateRetryOk && makeDecisionLater)
+        {
+            this.createTTSLink(true);
+
+            if (numberId && nextrec64 != #NextRecordNull && this.doCleanup(numberId))
+                NumberSeqGlobal::Instance().setClean(numberId, globalTransId,numTableNum.mustRunCompleteCleanUp());
+
+            if (voucherId && nextvoucher64 != #NextRecordNull && this.doCleanup(voucherId))
+                NumberSeqGlobal::Instance().setClean(voucherId,globalTransId,numTableVoucher.mustRunCompleteCleanUp());
+        }
+        return;
+    }
+
+    protected void useNumInternal()
+    {
+        #OCCRetryCount
+        
+        using (NumberSequenceConnection userConnection = NumberSequenceConnection::newEnsureDisposedBeforeTTSFinalization())
+        {
+            NumberSequenceList numberSequenceList;
+            int retryCount = 0;
+
+            userConnection.setConnection(numberSequenceList);
+
+            userConnection.tts_begin();
+
+            if (nextrec64 != #NextRecordNull && numberId)
+            {
+                try
+                {
+                    select forupdate firstonly numberSequenceList
+                    where numberSequenceList.NumberSequenceId == numberId
+                          && (numberSequenceList.NextRec == nextrec64 || numberSequenceList.NextRec64 == nextrec64)
+                          && (numberSequenceList.Status == NumStatus::Active || numberSequenceList.Status == NumStatus::ActiveNonBlocking);
+
+                    if (numberSequenceList)
+                    {
+                        numberSequenceList.TransId = globalTransId;
+                        numberSequenceList.update();
+                    }
+                    if (makeDecisionLater)
+                        ttsCreateRetryOk = true;
+                }
+                catch(Exception::UpdateConflict)
+                {
+                    retryCount++;
+                    if (retryCount >= #RetryNum)
+                    {
+                        userConnection.tts_abort();
+                        userConnection.finalize();
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+
+            }
+
+            if (nextvoucher64 != #NextRecordNull && voucherId)
+            {
+                retryCount = 0;
+                try
+                {
+                    select forupdate firstonly numberSequenceList
+                    where numberSequenceList.NumberSequenceId == voucherId
+                          && (numberSequenceList.NextRec == nextvoucher64 || numberSequenceList.NextRec64 == nextvoucher64)
+                          && (numberSequenceList.Status == NumStatus::Active || numberSequenceList.Status == NumStatus::ActiveNonBlocking);
+
+                    if (numberSequenceList)
+                    {
+                        numberSequenceList.TransId = globalTransId;
+                        numberSequenceList.update();
+                    }
+                    if (makeDecisionLater)
+                        ttsCreateRetryOk = true;
+                }
+                catch(Exception::UpdateConflict)
+                {
+                    retryCount++;
+                    if (retryCount >= #RetryNum)
+                    {
+                        userConnection.tts_abort();
+                        userConnection.finalize();
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+
+            }
+            userConnection.tts_commit();
+        }
+    }
+
+    public Voucher voucher()
+    {
+        if (!voucherId || numberId)
+            throw error("@SYS26051");
+
+        if (numTableVoucher.Manual)
+        {
+            nextvoucher = #NextRecordNull;
+            nextvoucher64 = #NextRecordNull;
+            lastVoucherNumGenerated = '';
+        }
+        else
+            this.runNumber();
+
+        return lastVoucherNumGenerated;
+    }
+
+    /// <summary>
+    ///    Executes the <c>abort</c> method on the server and returns a container that contains the packed
+    ///    class.
+    /// </summary>
+    /// <param name="_packedClass">
+    ///    A container that contains the packed class.
+    /// </param>
+    /// <param name="_classId">
+    ///    The class ID of the class.
+    /// </param>
+    /// <returns>
+    ///    A container that has the packed class.
+    /// </returns>
+    public static server container callAbortServer(
+        container   _packedClass,
+        ClassId     _classId)
+    {
+        NumberSeq numberSeq = NumberSeq::constructOnServerFromPackedClass(_packedClass,_classId);
+        numberSeq.abort();
+        return numberSeq.pack();
+    }
+
+    /// <summary>
+    ///    Executes the <c>used</c> method on the server and returns a container that contains the packed
+    ///    class.
+    /// </summary>
+    /// <param name="_packedClass">
+    ///    A container that contains the packed class.
+    /// </param>
+    /// <param name="_classId">
+    ///    The class ID of the class.
+    /// </param>
+    /// <returns>
+    ///    A container that contains the packed class.
+    /// </returns>
+    public static server container callUsedOnServer(
+        container   _packedClass,
+        ClassId     _classId)
+    {
+        NumberSeq numberSeq = NumberSeq::constructOnServerFromPackedClass(_packedClass,_classId);
+        numberSeq.used();
+        return numberSeq.pack();
+    }
+
+    static boolean checkChangeNumber(
+        NumberSequenceTable _numberSequenceTable,
+        TableId             _tableId,
+        FieldId             _fieldIdNum,
+        Num                 _origNum,
+        Num                 _newNum
+        )
+    {
+        NumberSequence64Range origNumStripped, newNumStripped;
+        DictField dictField;
+        ;
+
+        if (_origNum == _newNum)
+        {
+            return true;
+        }
+
+        if (!_numberSequenceTable.Format && _newNum != int642str(str2int64(_newNum)))
+        {
+            dictField = new DictField(_tableId,_fieldIdNum);
+            return checkFailed(strFmt("@SYS70843",dictField.label() ? dictField.label() : "@SYS13864"));
+        }
+
+        if (!_numberSequenceTable.Manual)
+        {
+            if (_numberSequenceTable.Format && !NumberSeq::numCheckFormat(_newNum,_numberSequenceTable))
+            {
+                return false;
+            }
+
+            if (_numberSequenceTable.Extended)
+            {
+                newNumStripped  = NumberSeq::numRemoveFormatV2(_newNum,_numberSequenceTable.Format);
+            }
+            else
+            {
+                newNumStripped  = NumberSeq::numRemoveFormat(_newNum,_numberSequenceTable.Format);
+            }
+            
+            if (newNumStripped <= 0)
+            {
+                dictField = new DictField(_tableId,_fieldIdNum);
+                return checkFailed(strFmt("@SYS70843",dictField.label() ? dictField.label() : "@SYS13864"));
+            }
+            if (newNumStripped < _numberSequenceTable.effectiveLowest())
+                return checkFailed(strFmt("@SYS70863",_numberSequenceTable.effectiveLowest()));
+            
+            if (newNumStripped > _numberSequenceTable.effectiveHighest())
+                return checkFailed(strFmt("@SYS70849",_numberSequenceTable.effectiveHighest()));
+            
+            // Only remove format from original if needed.
+            // The orig could be blank if manual and the method would return a false error.
+            if (_numberSequenceTable.Extended)
+            {
+                origNumStripped = NumberSeq::numRemoveFormatV2(_origNum,_numberSequenceTable.Format);
+            }
+            else
+            {
+                origNumStripped = NumberSeq::numRemoveFormat(_origNum,_numberSequenceTable.Format);
+            }
+
+            if (!_numberSequenceTable.AllowChangeDown && newNumStripped < origNumStripped)
+            {
+                dictField = new DictField(_tableId,_fieldIdNum);
+                checkFailed(strFmt("@SYS70843",dictField.label() ? dictField.label() : "@SYS13864"));
+                return checkFailed(strFmt("@SYS70844",_numberSequenceTable.NumberSequence));
+            }
+            if (!_numberSequenceTable.AllowChangeUp && newNumStripped > origNumStripped)
+            {
+                dictField = new DictField(_tableId,_fieldIdNum);
+                checkFailed(strFmt("@SYS70843",dictField.label() ? dictField.label() : "@SYS13864"));
+                return checkFailed(strFmt("@SYS70845",_numberSequenceTable.NumberSequence));
+            }
+        }
+        else
+        {
+            if (!NumberSeq::manualNumSeqCheckFormat(_newNum,_numberSequenceTable))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Checks format for manual number sequence.
+    /// </summary>
+    /// <param name="num"> The number to check. </param>
+    /// <param name="numberSequenceTable"> The NumberSequenceTable record. </param>
+    /// <returns>
+    ///    True if the number's format is valid, otherwise false.
+    /// </returns>
+    public static boolean manualNumSeqCheckFormat(Num num, NumberSequenceTable numberSequenceTable)
+    {
+        Integer                 x;
+        Num                     newNum                  = num;
+        NumberSequenceFormat    tmpTxt                  = numberSequenceTable.Format;
+        char                    formattingChar;
+        Integer                 numberLength            = strLen(num);
+
+        if (!tmpTxt)
+        {
+            return true;
+        }
+        
+        if (strLen(num) != strLen(tmpTxt))
+        {
+            return checkFailed(strFmt("@SYS25062", num, tmpTxt));
+        }
+        
+        x = strFind(tmpTxt, NumberSeq::formattingChars(), 1, numberLength);
+        while (x)
+        {
+            formattingChar = subStr(tmpTxt, x, 1);
+            switch(formattingChar)
+            {
+                case #SymbolNumerals:
+                    if(!isInteger(subStr(num, x, 1)))
+                    {
+                        return checkFailed(strFmt("@SYS25062", num, tmpTxt));
+                    }
+                    break;
+                case #SymbolLetters:
+                    char ch = subStr(num, x, 1);
+                    if (!(!isInteger(ch) && strAlpha(ch) == ch))
+                    {
+                        return checkFailed(strFmt("@SYS25062", num, tmpTxt));
+                    }
+                    break;
+                default:
+                    return checkFailed(strFmt("@SYS25062", num, tmpTxt));
+            }
+            newNum = strPoke(newNum,formattingChar, x);
+            x = strFind(tmpTxt, NumberSeq::formattingChars(), x + 1, numberLength);
+        }
+        
+        if (newNum != tmpTxt)
+        {
+            return checkFailed(strFmt("@SYS25062", num, tmpTxt));
+        }
+        
+        return true;
+    }
+
+    /// <summary>
+    ///    Initializes a new instance of the <c>NumberSeq</c> class.
+    /// </summary>
+    /// <returns>
+    ///    A new instance of the <c>NumberSeq</c> class.
+    /// </returns>
+    /// <remarks>
+    ///    There are multiple methods available in this class to reduce RPC class between this class and the
+    ///    caller class.
+    /// </remarks>
+    protected static server client NumberSeq construct()
+    {
+        return new NumberSeq();
+    }
+
+    /// <summary>
+    ///    Initializes a new instance of the <c>NumberSeq</c> class that supports the class from which it was
+    ///    called
+    /// </summary>
+    /// <returns>
+    ///    A new instance of the <c>NumberSeq</c> class.
+    /// </returns>
+    /// <remarks>
+    ///    There are multiple methods available in this class to reduce RPC class between this class and the
+    ///    caller class.
+    /// </remarks>
+    public static server client NumberSeq constructCalledFrom()
+    {
+        return NumberSeq::construct();
+    }
+
+    /// <summary>
+    ///    Initializes a new instance of the <c>NumberSeq</c> class that supports server run on request.
+    /// </summary>
+    /// <returns>
+    ///    A new instance of the <c>NumberSeq</c> class.
+    /// </returns>
+    /// <remarks>
+    ///    There are multiple methods available in this class to reduce RPC class between this class and the
+    ///    caller class.
+    /// </remarks>
+
+    public static server NumberSeq constructOnServer()
+    {
+        return NumberSeq::construct();
+    }
+
+    /// <summary>
+    ///    Initializes a new instance of the <c>NumberSeq</c> class from the packed version of the class.
+    /// </summary>
+    /// <param name="_packedClass">
+    ///    The class state to unpack.
+    /// </param>
+    /// <param name="_classId">
+    ///    The class to unpack.
+    /// </param>
+    /// <returns>
+    ///    The <c>NumberSeq</c> class that has the state of the packed class.
+    /// </returns>
+    /// <remarks>
+    ///    There are various methods available on this class to reduce RPC class between this class and the
+    ///    caller.
+    /// </remarks>
+    /// <exception cref="M:Exception::Error">
+    ///    Raised when the class ID is not recognized.
+    /// </exception>
+    public static server NumberSeq constructOnServerFromPackedClass(container _packedClass, ClassId _classId)
+    {
+        NumberSeq numberSeq;
+
+        if (_classId == classNum(NumberSeq))
+        {
+            numberSeq = NumberSeq::constructOnServer();
+        }
+        else if (_classId == classNum(NumberSeq_Fast))
+        {
+            numberSeq = NumberSeq_Fast::constructOnServer();
+        }
+        else
+        {
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        numberSeq.unpack(_packedClass);
+        return numberSeq;
+    }
+
+    /// <summary>
+    ///    Creates an instance of the <c>NumberSeq</c> class from a packed copy.
+    /// </summary>
+    /// <param name="_packedObject">
+    ///    The packed instance of the <c>NumberSeq</c> class from which to reinitialize.
+    /// </param>
+    /// <returns>
+    ///    A restored instance of the <c>NumberSeq</c> class.
+    /// </returns>
+    /// <remarks>
+    ///    This is part of the <c>SysPackable</c> interface.
+    /// </remarks>
+    public static NumberSeq create(container _packedObject)
+    {
+        NumberSeq newNumberSeq = new NumberSeq();
+        ;
+
+        newNumberSeq.unpack(_packedObject);
+
+        return newNumberSeq;
+    }
+
+    /// <summary>
+    ///    Creates an annotated format string from the specified format string.
+    /// </summary>
+    /// <param name="_format">
+    ///    The format string to create an annotated format string.
+    /// </param>
+    /// <returns>
+    ///    An annotated format string corresponding to the specified format string.
+    /// </returns>
+    /// <remarks>
+    ///    All non-formatting characters are treated as literal constants in the resulting annotated format
+    ///    string.
+    /// </remarks>
+    public static str createAnnotatedFormatFromFormat(str _format)
+    {
+        container segments;
+        int startIndex = 1;
+        str formattingChars = NumberSeq::formattingChars();
+        int formatLength = strLen(_format);
+        int currentIndex = 1;
+        boolean isFormattingSegment;
+        int typeIdentifier;
+        boolean done = false;
+
+        if (formatLength > 0)
+        {
+            isFormattingSegment = strFind(_format, formattingChars, 1, 1) != 0;
+
+            do
+            {
+                startIndex = currentIndex;
+
+                if (isFormattingSegment)
+                {
+                    currentIndex = strNFind(_format, formattingChars, startIndex, formatLength);
+                    typeIdentifier = #annotatedFormatFormattingSegment;
+                }
+                else
+                {
+                    currentIndex = strFind(_format, formattingChars, startIndex, formatLength);
+                    typeIdentifier = #annotatedFormatConstantSegment;
+                }
+
+                if (currentIndex == 0)
+                {
+                    currentIndex = formatLength + 1;
+                    done = true;
+                }
+
+                isFormattingSegment = !isFormattingSegment;
+
+                segments += [[typeIdentifier, subStr(_format, startIndex, currentIndex - startIndex)]];
+            }
+            while (!done);
+        }
+
+        return NumberSeq::createAnnotatedFormatFromSegments(segments);
+    }
+
+    /// <summary>
+    ///    Creates an annotated format string from the specified segment information.
+    /// </summary>
+    /// <param name="_segments">
+    ///    A container that has segment information, which consists of two elements. The first element is a
+    ///    <c>NumberSeqParameterType</c> enumeration value that describes the parameter type, -1 for a segment
+    ///    that contains a constant literal value, or -2 for a segment that contains formatting characters.
+    ///    The second element is the value of the segment. The type of the value is specific to the parameter
+    ///    type.
+    /// </param>
+    /// <param name="_includeAnnotationMarkers">
+    ///    A Boolean value that indicates whether the format string should contain the annotation markup. If
+    ///    false, only the values of the segment will be included.
+    /// </param>
+    /// <param name="_truncate">
+    ///    A Boolean value that indicates whether segments enclosed in format string should be truncated to
+    ///    ensure the format string is a maximum of 20 characters long.
+    /// </param>
+    /// <returns>
+    ///    An annotated format string from the specified segment information.
+    /// </returns>
+    /// <remarks>
+    ///    When the <paramref name="_includeAnnotationMarkers" />
+    ///     parameter is set equal to false, the method will generate the format string that corresponds to
+    ///    the annotated format string. When the <paramref name="_truncate" />
+    ///     parameter is set equal to true and truncation is required, the following is performed to reduce
+    ///    the length of the format:
+    ///    <list type="number">
+    ///       <item>
+    ///          <description>All constant literal values will be removed.</description>
+    ///       </item>
+    ///       <item>
+    ///          <description>Scope based segments will be shortened.</description>
+    ///       </item>
+    ///    </list>
+    /// </remarks>
+    public static str createAnnotatedFormatFromSegments(container _segments, boolean _includeAnnotationMarkers = true, boolean _truncate = false)
+    {
+        str 60 format;
+        container segment;
+        int segmentType;
+        str segmentValue;
+        int i;
+        int segmentLength;
+        int length = 0;
+        int lengthOfConstantSegments = 0;
+        int lengthOfFormattingSegments = 0;
+        int maxScopeSegmentLength = 0;
+        int numberOfScopeSegments = 0;
+        boolean skipConstantSegments = false;
+
+        if (_truncate)
+        {
+            for (i = 1; i <= conLen(_segments); i++)
+            {
+                segment = conPeek(_segments, i);
+                segmentType = conPeek(segment, #AnnotatedFormatSegment_TypeIndex);
+                segmentValue = conPeek(segment, #AnnotatedFormatSegment_ValueIndex);
+                segmentLength = strLen(segmentValue);
+                length += segmentLength;
+
+                switch (segmentType)
+                {
+                    case #AnnotatedFormatConstantSegment:
+                        lengthOfConstantSegments += segmentLength;
+                        break;
+
+                    case #AnnotatedFormatFormattingSegment:
+                        lengthOfFormattingSegments += segmentLength;
+                        break;
+
+                    default:
+                        numberOfScopeSegments += 1;
+                }
+            }
+
+            if (length > 20)
+            {
+                skipConstantSegments = true;
+                length -= lengthOfConstantSegments;
+
+                if (length > 20)
+                {
+                    maxScopeSegmentLength = (20 - lengthOfFormattingSegments) / numberOfScopeSegments;
+                }
+            }
+        }
+
+        for (i = 1; i <= conLen(_segments); i++)
+        {
+            segment = conPeek(_segments, i);
+            segmentType = conPeek(segment, #AnnotatedFormatSegment_TypeIndex);
+            segmentValue = conPeek(segment, #AnnotatedFormatSegment_ValueIndex);
+
+            switch (segmentType)
+            {
+                case #AnnotatedFormatConstantSegment:
+                    if (skipConstantSegments)
+                    {
+                        continue;
+                    }
+
+                case #AnnotatedFormatFormattingSegment:
+                    break;
+
+                default:
+                    if (maxScopeSegmentLength > 0)
+                    {
+                        segmentValue = subStr(segmentValue, 1, maxScopeSegmentLength);
+                    }
+                    break;
+            }
+
+            if (_includeAnnotationMarkers)
+            {
+                if (i != 1)
+                {
+                    format += #AnnotatedFormatSegmentDelimiter;
+                }
+
+                format += int2str(segmentType) + #AnnotatedFormatDelimiter;
+            }
+
+            format += segmentValue;
+        }
+
+        return format;
+    }
+
+    public client server static boolean extendedFormInfo()
+    {
+        return false;
+    }
+
+    /*
+    AOSRunMode::calledfrom
+    */
+
+    public client server static int formatCountSymbols(Num num)
+    {
+        Integer x;
+        Integer i;
+        Num     tmpTxt = num;
+
+        if (!num)
+            return 0;
+
+        x = strFind(num, NumberSeq::formattingChars(),1,999);
+        while (x)
+        {
+            i++;
+            x = strFind(num, NumberSeq::formattingChars(),x + 1,999);
+        }
+        return i;
+    }
+
+    // <GEERU>
+    public static NumberSequenceFormat formatOfNum_W(Num _num)
+    {
+        return strRem(_num,NumberSeq::formattingChars());
+    }
+
+    //</GEERU>
+    /// <summary>
+    ///    Gets a string that contains each valid formatting character.
+    /// </summary>
+    /// <returns>
+    ///    A string that contains each valid formatting character.
+    /// </returns>
+    public static client server str formattingChars()
+    {
+        return #FormattingSymbols;
+    }
+
+    public static Num getNextNumForRefParmId()
+    {
+        Num num;
+
+        PartyIProvider partyProvider = PartyProviderFactory::getPartyProvider();
+
+        if (partyProvider)
+        {
+            num = NumberSeq::newGetNum(partyProvider.numRefParmId()).num();
+        }
+
+        return num;
+    }
+
+    [SysObsolete('Please use highestV2 instead', false, 30\6\2020)]
+    public static Integer highest(RefRecId _numberSequenceId)
+    {
+        return int642int(NumberSeq::highestV2(_numberSequenceId));
+    }
+
+    public static NumberSequence64Range highestV2(RefRecId _numberSequenceId)
+    {
+        return NumberSequenceTable::find(_numberSequenceId).effectiveHighest();
+    }
+
+    /// <summary>
+    ///    Initializes a new instance of the <c>NumberSeq</c> class or a class that derives from the
+    ///    <c>NumberSeq</c> class.
+    /// </summary>
+    /// <param name="_continuous">
+    ///    A <c>NoYes</c> enumeration value that is used to construct the class.
+    /// </param>
+    /// <returns>
+    ///    A new instance of the <c>NumberSeq</c> class or a class that derives from the <c>NumberSeq</c>
+    ///    class.
+    /// </returns>
+    public static server client NumberSeq newFromParameters(NoYes _continuous)
+    {
+        if (_continuous)
+        {
+            return NumberSeq::constructCalledFrom();
+        }
+
+        return NumberSeq_Fast::constructCalledFrom();
+    }
+
+    private static boolean isManualNumberSequenceForbiddenForReference(NumberSequenceReference _reference)
+    {
+        return ScaleUnit::instance().isScaleUnitFeatureEnabled() && NumberSequenceScaleUnitGovernor::instance().isManualNumberSequenceBlockedForReference(_reference);
+    }
+
+    private static boolean isManualNumberSequenceForbiddenForSequence(NumberSequenceTable _numberSequenceTable)
+    {
+        return ScaleUnit::instance().isScaleUnitFeatureEnabled() && NumberSequenceScaleUnitGovernor::instance().isManualNumberSequenceBlockedForSequence(_numberSequenceTable);
+    }
+
+    public static server NumberSeq newGetNum(
+        NumberSequenceReference _numberSequenceReference,
+        boolean                 _makeDecisionLater          = false,
+        boolean                 _dontThrowOnMissingRefSetUp = false
+        //<GEERU><GEEU>
+        ,UnknownNoYes            _allowManual                = UnknownNoYes::Unknown
+        //</GEERU></GEEU>
+        )
+    {
+        if (NumberSeq::isManualNumberSequenceForbiddenForReference(_numberSequenceReference))
+        {
+            _allowManual = UnknownNoYes::No;
+        }
+
+        NumberSeq               numberSeq;
+        NumberSequenceTable     numberSequenceTableNum;
+
+        if (!_numberSequenceReference)
+        {
+            if (_dontThrowOnMissingRefSetUp)
+                return numberSeq;
+            throw error(strfmt("@SYS53912"));
+        }
+        numberSequenceTableNum = NumberSequenceTable::find(_numberSequenceReference.NumberSequenceId);
+
+        if (!numberSequenceTableNum)
+        {
+            if (_dontThrowOnMissingRefSetUp)
+                return numberSeq;
+            throw error(strfmt("@SYS53911",_numberSequenceReference.referenceLabel(),_numberSequenceReference.referenceModuleLabel()));
+        }
+
+        //<GEERU><GEEU>
+        switch (_allowManual)
+        {
+            case UnknownNoYes::No:
+                if (numberSequenceTableNum.Manual)
+                {
+                    if (_dontThrowOnMissingRefSetUp)
+                        return numberSeq;
+                    throw error(strfmt("@GLS104926", _numberSequenceReference.referenceLabel(), _numberSequenceReference.referenceModuleLabel()));
+                }
+                break;
+            case UnknownNoYes::Yes:
+                if (! numberSequenceTableNum.Manual)
+                {
+                    if (_dontThrowOnMissingRefSetUp)
+                        return numberSeq;
+                    throw error(strfmt("@GLS107211", _numberSequenceReference.referenceLabel(), _numberSequenceReference.referenceModuleLabel()));
+                }
+                break;
+        }
+        //</GEERU></GEEU>
+
+        numberSeq = NumberSeq::newFromParameters(numberSequenceTableNum.Continuous);
+
+        numberSeq.parmNumberSequenceCode(numberSequenceTableNum.NumberSequence);
+        numberSeq.parmNumberSequenceId(numberSequenceTableNum.RecId);
+        numberSeq.parmRefTableNum(_numberSequenceReference);
+        numberSeq.parmNumTableNum(numberSequenceTableNum);
+        numberSeq.parmMakeDecisionLater(_makeDecisionLater);
+
+        return numberSeq;
+    }
+
+    public static server NumberSeq newGetNumAndVoucher(
+        NumberSequenceReference _numberSequenceReference,
+        NumberSequenceReference _voucherSequenceReference,
+        boolean                 _makeDecisionLater          = false,
+        boolean                 _dontThrowOnMissingRefSetUp = false
+        //<GEERU><GEEU>
+        ,UnknownNoYes            _allowManual                = UnknownNoYes::Unknown
+        //</GEERU></GEEU>
+        )
+    {
+        if (NumberSeq::isManualNumberSequenceForbiddenForReference(_numberSequenceReference))
+        {
+            _allowManual = UnknownNoYes::No;
+        }
+
+        NumberSeq               numberSeq;
+        NumberSequenceTable     numberSequenceTableNum;
+        NumberSequenceTable     numberSequenceTableVoucher;
+        NumberSequenceDatatype  numberDatatype;
+        NumberSequenceDatatype  voucherDatatype;
+        NoYes                   continuousSequence = NoYes::No;
+
+        if (!_numberSequenceReference || !_voucherSequenceReference)
+        {
+            if (_dontThrowOnMissingRefSetUp)
+                return numberSeq;
+            throw error(strfmt("@SYS53912"));
+        }
+
+        numberDatatype = NumberSequenceDatatype::find(_numberSequenceReference.NumberSequenceDatatype);
+        voucherDatatype = NumberSequenceDatatype::find(_voucherSequenceReference.NumberSequenceDatatype);
+        numberSequenceTableNum     = NumberSequenceTable::find(_numberSequenceReference.NumberSequenceId);
+        numberSequenceTableVoucher = NumberSequenceTable::find(_voucherSequenceReference.NumberSequenceId);
+
+        if (_voucherSequenceReference.AllowSameAs && voucherDatatype.DataTypeSameAsId == numberDatatype.DatatypeId)
+            numberSequenceTableVoucher = numberSequenceTableNum;
+
+        if (!numberSequenceTableNum)
+        {
+            if (_dontThrowOnMissingRefSetUp)
+                return numberSeq;
+            throw error(strfmt("@SYS53911",_numberSequenceReference.referenceLabel(),_numberSequenceReference.referenceModuleLabel()));
+        }
+        if (!numberSequenceTableVoucher)
+        {
+            if (_dontThrowOnMissingRefSetUp)
+                return numberSeq;
+            throw error(strfmt("@SYS53911",_voucherSequenceReference.referenceLabel(),_voucherSequenceReference.referenceModuleLabel()));
+        }
+
+        if (numberSequenceTableVoucher.Continuous != numberSequenceTableNum.Continuous)
+        {
+            checkFailed(strfmt("@SYS26206",numberSequenceTableNum.NumberSequence,numberSequenceTableVoucher.NumberSequence));
+            checkFailed(strfmt("@SYS26207",numberSequenceTableVoucher.Continuous == NoYes::No ? numberSequenceTableVoucher.NumberSequence : numberSequenceTableNum.NumberSequence));
+            checkFailed(strfmt("@SYS26208",numberSequenceTableVoucher.Continuous == NoYes::Yes ? numberSequenceTableVoucher.NumberSequence : numberSequenceTableNum.NumberSequence));
+            throw error("@SYS18447");
+        }
+        if (numberSequenceTableVoucher.Manual != numberSequenceTableNum.Manual)
+        {
+            checkFailed(strfmt("@SYS26206",numberSequenceTableNum.NumberSequence,numberSequenceTableVoucher.NumberSequence));
+            checkFailed(strfmt("@SYS26209",numberSequenceTableVoucher.Manual  ? numberSequenceTableVoucher.NumberSequence : numberSequenceTableNum.NumberSequence));
+            checkFailed(strfmt("@SYS26210",!numberSequenceTableVoucher.Manual ? numberSequenceTableVoucher.NumberSequence : numberSequenceTableNum.NumberSequence));
+            throw error("@SYS18447");
+        }
+
+        //<GEERU><GEEU>
+        switch (_allowManual)
+        {
+            case UnknownNoYes::No:
+                if (numberSequenceTableNum.Manual)
+                {
+                    if (_dontThrowOnMissingRefSetUp)
+                        return numberSeq;
+
+                    checkFailed(strfmt("@GLS104926", _numberSequenceReference.referenceLabel(),  _numberSequenceReference.referenceModuleLabel()));
+                    checkFailed(strfmt("@GLS104926", _voucherSequenceReference.referenceLabel(), _voucherSequenceReference.referenceModuleLabel()));
+                    throw error("@SYS18447");
+                }
+                break;
+            case UnknownNoYes::Yes:
+                if (! numberSequenceTableNum.Manual)
+                {
+                    if (_dontThrowOnMissingRefSetUp)
+                        return numberSeq;
+
+                    checkFailed(strfmt("@GLS107211", _numberSequenceReference.referenceLabel(),  _numberSequenceReference.referenceModuleLabel()));
+                    checkFailed(strfmt("@GLS107211", _voucherSequenceReference.referenceLabel(), _voucherSequenceReference.referenceModuleLabel()));
+                    throw error("@SYS18447");
+                }
+                break;
+        }
+        //</GEERU></GEEU>
+
+        if (numberSequenceTableNum.Continuous || numberSequenceTableVoucher.Continuous)
+        {
+            continuousSequence = NoYes::Yes;
+        }
+
+        numberSeq = NumberSeq::newFromParameters(continuousSequence);
+
+        numberSeq.parmNumberSequenceCode(numberSequenceTableNum.NumberSequence);
+        numberSeq.parmNumberSequenceId(numberSequenceTableNum.RecId);
+        numberSeq.parmRefTableNum(_numberSequenceReference);
+        numberSeq.parmNumTableNum(numberSequenceTableNum);
+
+        numberSeq.parmVoucherSequenceCode(numberSequenceTableVoucher.NumberSequence);
+        numberSeq.parmVoucherSequenceId(numberSequenceTableVoucher.RecId);
+        numberSeq.parmRefTableVoucher(_voucherSequenceReference);
+        numberSeq.parmNumTableVoucher(numberSequenceTableVoucher);
+
+        numberSeq.parmMakeDecisionLater(_makeDecisionLater);
+
+        return numberSeq;
+    }
+
+    public static NumberSeq newGetNumAndVoucherFromCode(
+            NumberSequenceCode    _numberSequenceCode,
+            NumberSequenceCode    _voucherSequenceCode,
+            NumberSeqScope        _scope = NumberSeqScopeFactory::createDefaultScope(),
+            boolean               _voucherMustCopyNum         = false,
+            boolean               _makeDecisionLater          = false,
+            boolean               _dontThrowOnMissingRefSetUp = false,
+            //<GEERU><GEEU>
+            UnknownNoYes          _allowManual                = UnknownNoYes::Unknown
+            //</GEERU></GEEU>
+            )
+    {
+        NumberSequenceTable numSequence = NumberSequenceTable::findByNaturalKey(_numberSequenceCode, _scope.getId());
+        NumberSequenceTable voucherNumSequence = NumberSequenceTable::findByNaturalKey(_voucherSequenceCode, _scope.getId());
+        if (NumberSeq::isManualNumberSequenceForbiddenForSequence(numSequence) || NumberSeq::isManualNumberSequenceForbiddenForSequence(voucherNumSequence))
+        {
+            _allowManual = UnknownNoYes::No;
+        }
+
+        return NumberSeq::newGetNumAndVoucherFromId(
+                    numSequence.RecId,
+                    voucherNumSequence.RecId,
+                    _voucherMustCopyNum,
+                    _makeDecisionLater,
+                    _dontThrowOnMissingRefSetUp,
+                    //<GEERU><GEEU>
+                    _allowManual);
+        //</GEERU></GEEU>
+    }
+
+    public static server NumberSeq newGetNumAndVoucherFromId(RefRecId         _numberSequenceId,
+                                                 RefRecId              _voucherSequenceId,
+                                                 boolean               _voucherMustCopyNum         = false,
+                                                 boolean               _makeDecisionLater          = false,
+                                                 boolean               _dontThrowOnMissingRefSetUp = false,
+                                                 //<GEERU><GEEU>
+                                                 UnknownNoYes          _allowManual                = UnknownNoYes::Unknown
+                                                 //</GEERU></GEEU>
+                                                 )
+    {
+        NumberSeq               numberSeq;
+        NumberSequenceTable     numberSequenceTableNum      = NumberSequenceTable::find(_numberSequenceId);
+        NumberSequenceTable     numberSequenceTableVoucher  = NumberSequenceTable::find(_voucherSequenceId);
+        NoYes                   continuousSequence          = NoYes::No;
+
+        if (NumberSeq::isManualNumberSequenceForbiddenForSequence(numberSequenceTableNum) || NumberSeq::isManualNumberSequenceForbiddenForSequence(numberSequenceTableVoucher))
+        {
+            _allowManual = UnknownNoYes::No;
+        }
+
+        if (!numberSequenceTableNum)
+        {
+            if (_dontThrowOnMissingRefSetUp)
+                return numberSeq;
+            throw error("@SYS54052");
+        }
+        if (!numberSequenceTableVoucher)
+        {
+            if (_dontThrowOnMissingRefSetUp)
+                return numberSeq;
+            throw error("@SYS54052");
+        }
+        if (numberSequenceTableVoucher.Continuous != numberSequenceTableNum.Continuous)
+        {
+            checkFailed(strFmt("@SYS26206",numberSequenceTableNum.NumberSequence,numberSequenceTableVoucher.NumberSequence));
+            checkFailed(strFmt("@SYS26207",numberSequenceTableVoucher.Continuous == NoYes::No ? numberSequenceTableVoucher.NumberSequence : numberSequenceTableNum.NumberSequence));
+            checkFailed(strFmt("@SYS26208",numberSequenceTableVoucher.Continuous == NoYes::Yes ? numberSequenceTableVoucher.NumberSequence : numberSequenceTableNum.NumberSequence));
+            throw error("@SYS18447");
+        }
+
+        if (numberSequenceTableVoucher.Manual != numberSequenceTableNum.Manual)
+        {
+            checkFailed(strFmt("@SYS26206",numberSequenceTableNum.NumberSequence,numberSequenceTableVoucher.NumberSequence));
+            checkFailed(strFmt("@SYS26209",numberSequenceTableVoucher.Manual  ? numberSequenceTableVoucher.NumberSequence : numberSequenceTableNum.NumberSequence));
+            checkFailed(strFmt("@SYS26210",!numberSequenceTableVoucher.Manual ? numberSequenceTableVoucher.NumberSequence : numberSequenceTableNum.NumberSequence));
+            throw error("@SYS18447");
+        }
+
+        //<GEERU><GEEU>
+        switch (_allowManual)
+        {
+            case UnknownNoYes::No:
+                if (numberSequenceTableNum.Manual)
+                {
+                    if (_dontThrowOnMissingRefSetUp)
+                        return numberSeq;
+
+                    checkFailed(strFmt("@SYS26209", numberSequenceTableNum.NumberSequence));
+                    checkFailed(strFmt("@SYS26209", numberSequenceTableVoucher.NumberSequence));
+                    throw error("@SYS18447");
+                }
+                break;
+            case UnknownNoYes::Yes:
+                if (! numberSequenceTableNum.Manual)
+                {
+                    if (_dontThrowOnMissingRefSetUp)
+                        return numberSeq;
+                    checkFailed(strFmt("@SYS26210", numberSequenceTableNum.NumberSequence));
+                    checkFailed(strFmt("@SYS26210", numberSequenceTableVoucher.NumberSequence));
+                    throw error("@SYS18447");
+                }
+                break;
+        }
+        //</GEERU></GEEU>
+
+        if (numberSequenceTableNum.Continuous || numberSequenceTableVoucher.Continuous)
+        {
+            continuousSequence = NoYes::Yes;
+        }
+
+        numberSeq = NumberSeq::newFromParameters(continuousSequence);
+
+        numberSeq.parmNumberSequenceId(numberSequenceTableNum.RecId);
+        numberSeq.parmNumberSequenceCode(numberSequenceTableNum.NumberSequence);
+        numberSeq.parmNumTableNum(numberSequenceTableNum);
+
+        numberSeq.parmVoucherSequenceId(numberSequenceTableVoucher.RecId);
+        numberSeq.parmVoucherSequenceCode(numberSequenceTableVoucher.NumberSequence);
+        numberSeq.parmNumTableVoucher(numberSequenceTableVoucher);
+
+        numberSeq.parmMakeDecisionLater(_makeDecisionLater);
+        numberSeq.parmForcedCopyOf(_voucherMustCopyNum);
+
+        return numberSeq;
+    }
+
+    public static NumberSeq newGetNumFromCode(
+            NumberSequenceCode  _numberSequenceCode,
+            NumberSeqScope      _scope = NumberSeqScopeFactory::createDefaultScope(),
+            boolean             _makeDecisionLater           = false,
+            boolean             _dontThrowOnMissingRefSetUp  = false,
+            SysLastValue        _nextNumSeq = null,
+            boolean             _fillNextNumSeq = false,
+            //<GEERU><GEEU>
+            UnknownNoYes        _allowManual    = UnknownNoYes::Unknown)
+            //</GEERU></GEEU>
+    {
+        NumberSeqInstrumentationHelper::emitGetNumberSequenceFromCode(
+            _numberSequenceCode,
+            _scope.getId(),
+            _makeDecisionLater,
+            _dontThrowOnMissingRefSetUp,
+            _fillNextNumSeq,
+            _allowManual);
+
+        if (_numberSequenceCode == null && !_dontThrowOnMissingRefSetUp)
+            throw error(strFmt("@SYS104799"));
+
+        NumberSequenceTable numSeq = NumberSequenceTable::findByNaturalKey(_numberSequenceCode, _scope.getId());
+
+        if (NumberSeq::isManualNumberSequenceForbiddenForSequence(numSeq))
+        {
+            _allowManual = UnknownNoYes::No;
+        }
+
+        return NumberSeq::newGetNumFromId(
+                    numSeq.RecId,
+                    _makeDecisionLater,
+                    _dontThrowOnMissingRefSetUp,
+                    _nextNumSeq,
+                    _fillNextNumSeq,
+                    //<GEERU><GEEU>
+                    _allowManual);
+        //</GEERU></GEEU>
+    }
+
+    public static NumberSeq newGetNumFromId(
+                                       RefRecId             _numberSequenceId,
+                                       boolean             _makeDecisionLater           = false,
+                                       boolean             _dontThrowOnMissingRefSetUp  = false,
+                                       SysLastValue         _nextNumSeq = null,
+                                       boolean             _fillNextNumSeq = false,
+                                       //<GEERU><GEEU>
+                                       UnknownNoYes        _allowManual    = UnknownNoYes::Unknown
+                                       //</GEERU></GEEU>
+                                       )
+    {
+        NumberSeqInstrumentationHelper::emitGetNumberSequenceFromId(
+            _numberSequenceId,
+            _makeDecisionLater,
+            _dontThrowOnMissingRefSetUp,
+            _fillNextNumSeq,
+            _allowManual);
+
+        if (_numberSequenceId == 0 && !_dontThrowOnMissingRefSetUp)
+            throw error(strFmt("@SYS104799"));
+
+        NumberSequenceTable     numberSequenceTableNum = NumberSequenceTable::find(_numberSequenceId);
+
+        if (NumberSeq::isManualNumberSequenceForbiddenForSequence(numberSequenceTableNum ))
+        {
+            _allowManual = UnknownNoYes::No;
+        }
+
+        NumberSeq               numberSeq;
+
+        if (!numberSequenceTableNum)
+        {
+            if (_dontThrowOnMissingRefSetUp)
+                return numberSeq;
+            throw error(strFmt("@SYS26271", _numberSequenceId));
+        }
+
+        //<GEERU><GEEU>
+        switch (_allowManual)
+        {
+            case UnknownNoYes::No:
+                if (numberSequenceTableNum.Manual)
+                {
+                    if (_dontThrowOnMissingRefSetUp)
+                        return numberSeq;
+                    throw error(strFmt("@SYS26209", numberSequenceTableNum.NumberSequence));
+                }
+                break;
+            case UnknownNoYes::Yes:
+                if (! numberSequenceTableNum.Manual)
+                {
+                    if (_dontThrowOnMissingRefSetUp)
+                        return numberSeq;
+                    throw error(strFmt("@SYS26210", numberSequenceTableNum.NumberSequence));
+                }
+                break;
+        }
+        //</GEERU></GEEU>
+
+        numberSeq = NumberSeq::newFromParameters(numberSequenceTableNum.Continuous);
+
+        numberSeq.parmNumberSequenceId(_numberSequenceId);
+        numberSeq.parmNumberSequenceCode(numberSequenceTableNum.NumberSequence);
+        numberSeq.parmNumTableNum(numberSequenceTableNum);
+        numberSeq.parmMakeDecisionLater(_makeDecisionLater);
+
+        if(_fillNextNumSeq)
+        {
+            _nextNumSeq.Value = [numberSeq.num()];
+        }
+        return numberSeq;
+    }
+
+    public static server container newGetNumFromIdPacked(
+                                       RefRecId             _numberSequenceId,
+                                       boolean             _makeDecisionLater           = false,
+                                       boolean             _dontThrowOnMissingRefSetUp  = false,
+                                       SysLastValue         _nextNumSeq = null,
+                                       boolean             _fillNextNumSeq = false
+                                      )
+    {
+
+        NumberSeq numberSeq = NumberSeq::newGetNumFromId(_numberSequenceId,_makeDecisionLater,_dontThrowOnMissingRefSetUp,_nextNumSeq,_fillNextNumSeq);
+
+        return [numberSeq.pack(),classIdGet(numberSeq)];
+    }
+
+    public static server NumberSeq newGetVoucher(
+        NumberSequenceReference _voucherSequenceReference,
+        boolean                 _makeDecisionLater          = false,
+        boolean                 _dontThrowOnMissingRefSetUp = false
+        //<GEERU><GEEU>
+        ,UnknownNoYes            _allowManual                = UnknownNoYes::Unknown
+        //</GEERU></GEEU>
+        )
+    {
+        if (NumberSeq::isManualNumberSequenceForbiddenForReference(_voucherSequenceReference))
+        {
+            _allowManual = UnknownNoYes::No;
+        }
+
+        NumberSeq               numberSeq;
+        NumberSequenceTable     numberSequenceTableVoucher;
+
+        if (!_voucherSequenceReference)
+        {
+            if (_dontThrowOnMissingRefSetUp)
+                return numberSeq;
+            throw error(strfmt("@SYS53912"));
+        }
+        numberSequenceTableVoucher = NumberSequenceTable::find(_voucherSequenceReference.NumberSequenceId);
+
+        if (!numberSequenceTableVoucher)
+        {
+            if (_dontThrowOnMissingRefSetUp)
+                return numberSeq;
+            throw error(strfmt("@SYS53911",_voucherSequenceReference.referenceLabel(),_voucherSequenceReference.referenceModuleLabel()));
+        }
+
+        //<GEERU><GEEU>
+        switch (_allowManual)
+        {
+            case UnknownNoYes::No:
+                if (numberSequenceTableVoucher.Manual)
+                {
+                    if (_dontThrowOnMissingRefSetUp)
+                        return numberSeq;
+                    throw error(strfmt("@GLS104926", _voucherSequenceReference.referenceLabel(), _voucherSequenceReference.referenceModuleLabel()));
+                }
+                break;
+            case UnknownNoYes::Yes:
+                if (! numberSequenceTableVoucher.Manual)
+                {
+                    if (_dontThrowOnMissingRefSetUp)
+                        return numberSeq;
+                    throw error(strfmt("@GLS107211", _voucherSequenceReference.referenceLabel(), _voucherSequenceReference.referenceModuleLabel()));
+                }
+                break;
+        }
+        //</GEERU></GEEU>
+
+        numberSeq = NumberSeq::newFromParameters(numberSequenceTableVoucher.Continuous);
+
+        numberSeq.parmVoucherSequenceId(numberSequenceTableVoucher.RecId);
+        numberSeq.parmVoucherSequenceCode(numberSequenceTableVoucher.NumberSequence);
+        numberSeq.parmRefTableVoucher(_voucherSequenceReference);
+        numberSeq.parmNumTableVoucher(numberSequenceTableVoucher);
+        numberSeq.parmMakeDecisionLater(_makeDecisionLater);
+
+        return numberSeq;
+    }
+
+    public static NumberSeq newGetVoucherFromCode(
+                NumberSequenceCode  _voucherSequenceCode,
+                NumberSeqScope      _scope = NumberSeqScopeFactory::createDefaultScope(),
+                boolean             _makeDecisionLater           = false,
+                boolean             _dontThrowOnMissingRefSetUp  = false,
+                //<GEERU><GEEU>
+                UnknownNoYes        _allowManual                 = UnknownNoYes::Unknown)
+                //</GEERU></GEEU>
+    {
+        NumberSequenceTable numSequence = NumberSequenceTable::findByNaturalKey(_voucherSequenceCode, _scope.getId());
+
+        if (NumberSeq::isManualNumberSequenceForbiddenForSequence(numSequence))
+        {
+            _allowManual = UnknownNoYes::No;
+        }
+
+        return NumberSeq::newGetVoucherFromId(
+                    numSequence.RecId,
+                    _makeDecisionLater,
+                    _dontThrowOnMissingRefSetUp,
+                    //<GEERU><GEEU>
+                    _allowManual);
+        //</GEERU></GEEU>
+    }
+
+    public static server NumberSeq newGetVoucherFromId(RefRecId       _voucherSequenceId,
+                                           boolean             _makeDecisionLater           = false,
+                                           boolean             _dontThrowOnMissingRefSetUp  = false,
+                                           //<GEERU><GEEU>
+                                           UnknownNoYes        _allowManual                 = UnknownNoYes::Unknown
+                                           //</GEERU></GEEU>
+                                           )
+    {
+        NumberSeq               numberSeq;
+        NumberSequenceTable     numberSequenceTableVoucher  = NumberSequenceTable::find(_voucherSequenceId);
+
+        if (NumberSeq::isManualNumberSequenceForbiddenForSequence(numberSequenceTableVoucher))
+        {
+            _allowManual = UnknownNoYes::No;
+        }
+
+        if (!numberSequenceTableVoucher)
+        {
+            if (_dontThrowOnMissingRefSetUp)
+                return numberSeq;
+            throw error(strFmt("@SYS26271",_voucherSequenceId));
+        }
+
+        //</GEERU></GEEU>
+        switch (_allowManual)
+        {
+            case UnknownNoYes::No:
+                if (numberSequenceTableVoucher.Manual)
+                {
+                    if (_dontThrowOnMissingRefSetUp)
+                        return numberSeq;
+                    throw error(strFmt("@SYS26209", numberSequenceTableVoucher.NumberSequence));
+                }
+                break;
+            case UnknownNoYes::Yes:
+                if (! numberSequenceTableVoucher.Manual)
+                {
+                    if (_dontThrowOnMissingRefSetUp)
+                        return numberSeq;
+                    throw error(strFmt("@SYS26210", numberSequenceTableVoucher.NumberSequence));
+                }
+                break;
+        }
+        //</GEERU></GEEU>
+
+        numberSeq = NumberSeq::newFromParameters(numberSequenceTableVoucher.Continuous);
+
+        numberSeq.parmVoucherSequenceId(numberSequenceTableVoucher.RecId);
+        numberSeq.parmVoucherSequenceCode(numberSequenceTableVoucher.NumberSequence);
+        numberSeq.parmNumTableVoucher(numberSequenceTableVoucher);
+        numberSeq.parmMakeDecisionLater(_makeDecisionLater);
+        return numberSeq;
+    }
+
+    public static server NumberSeq newReserveNum(
+        NumberSequenceReference _numberSequenceReference,
+        boolean                 _makeDecisionLater          = false,
+        boolean                 _dontThrowOnMissingRefSetUp = false
+        )
+    {
+        NumberSeq               numberSeq;
+        NumberSequenceTable     numberSequenceTableNum;
+
+        if (!_numberSequenceReference)
+        {
+            if (_dontThrowOnMissingRefSetUp)
+                return numberSeq;
+            throw error("@SYS53912");
+        }
+        numberSequenceTableNum = NumberSequenceTable::find(_numberSequenceReference.NumberSequenceId);
+
+        if (!numberSequenceTableNum)
+        {
+            if (_dontThrowOnMissingRefSetUp)
+                return numberSeq;
+            throw error(strFmt("@SYS53911",_numberSequenceReference.referenceLabel(),_numberSequenceReference.referenceModuleLabel()));
+        }
+
+        numberSeq = NumberSeq::newFromParameters(numberSequenceTableNum.Continuous);
+
+        numberSeq.parmNumberSequenceId(numberSequenceTableNum.RecId);
+        numberSeq.parmNumberSequenceCode(numberSequenceTableNum.NumberSequence);
+        numberSeq.parmRefTableNum(_numberSequenceReference);
+        numberSeq.parmNumTableNum(numberSequenceTableNum);
+        numberSeq.parmMakeDecisionLater(_makeDecisionLater);
+
+        return numberSeq;
+    }
+
+    public static server NumberSeq newReserveNumFromCode(
+                NumberSequenceCode  _numberSequenceCode,
+                NumberSeqScope      _scope = NumberSeqScopeFactory::createDefaultScope(),
+                boolean             _makeDecisionLater           = false,
+                boolean             _dontThrowOnMissingRefSetUp  = false)
+    {
+        return NumberSeq::newReserveNumFromId(
+                    NumberSequenceTable::findByNaturalKey(_numberSequenceCode, _scope.getId()).RecId,
+                    _makeDecisionLater,
+                    _dontThrowOnMissingRefSetUp);
+    }
+
+    public static server NumberSeq newReserveNumFromId(
+            RefRecId            _numberSequenceId,
+            boolean             _makeDecisionLater           = false,
+            boolean             _dontThrowOnMissingRefSetUp  = false)
+    {
+        NumberSeq               numberSeq;
+        NumberSequenceTable     numberSequenceTableNum = NumberSequenceTable::find(_numberSequenceId);
+
+        if (!numberSequenceTableNum)
+        {
+            if (_dontThrowOnMissingRefSetUp)
+                return numberSeq;
+            throw error(strFmt("@SYS26271",_numberSequenceId));
+        }
+
+        numberSeq = NumberSeq::newFromParameters(numberSequenceTableNum.Continuous);
+
+        numberSeq.parmNumberSequenceId(_numberSequenceId);
+        numberSeq.parmNumberSequenceCode(numberSequenceTableNum.NumberSequence);
+        numberSeq.parmNumTableNum(numberSequenceTableNum);
+        numberSeq.parmMakeDecisionLater(_makeDecisionLater);
+
+        return numberSeq;
+    }
+
+    public static server NumberSeq newReserveVoucherFromCode(NumberSequenceCode  _voucherSequenceCode,
+        NumberSeqScope      _scope = NumberSeqScopeFactory::createDefaultScope(),
+        boolean             _makeDecisionLater           = false,
+        boolean             _dontThrowOnMissingRefSetUp  = false)
+    {
+        RefRecId voucherSequenceId = NumberSequenceTable::findByNaturalKey(
+            _voucherSequenceCode,
+            _scope.getId()).RecId;
+        ;
+
+        return NumberSeq::newReserveVoucherFromId(voucherSequenceId, _makeDecisionLater,
+            _dontThrowOnMissingRefSetUp);
+    }
+
+    public static NumberSeq newReserveVoucherFromId(
+        RefRecId  _voucherSequenceId,
+        boolean   _makeDecisionLater = false,
+        boolean   _dontThrowOnMissingRefSetUp = false)
+    {
+        NumberSeq               numberSeq;
+        NumberSequenceTable     numberSequenceTableVoucher  = NumberSequenceTable::find(_voucherSequenceId);
+
+        if (!numberSequenceTableVoucher)
+        {
+            if (_dontThrowOnMissingRefSetUp)
+                return numberSeq;
+            throw error(strFmt("@SYS26271",_voucherSequenceId));
+        }
+
+        numberSeq = NumberSeq::newFromParameters(numberSequenceTableVoucher.Continuous);
+
+        numberSeq.parmVoucherSequenceId(numberSequenceTableVoucher.RecId);
+        numberSeq.parmVoucherSequenceCode(numberSequenceTableVoucher.NumberSequence);
+        numberSeq.parmNumTableVoucher(numberSequenceTableVoucher);
+        numberSeq.parmMakeDecisionLater(_makeDecisionLater);
+        return numberSeq;
+    }
+
+    /*
+    AOSRunMode::calledfrom
+    */
+
+    public static boolean numCheckFormat(Num num, NumberSequenceTable numberSequenceTable)
+    {
+        Integer                 x;
+        Num                     newNum      = num;
+        NumberSequenceFormat    tmpTxt      = numberSequenceTable.Format;
+        char                    formattingChar;
+        NumberSequence64Range   val         = #NextRecordNull;
+
+        if (!tmpTxt)
+            return true;
+
+        if (strLen(num) != strLen(tmpTxt))
+            return checkFailed(strFmt("@SYS25062",num,numberSequenceTable.Format));
+
+        x = strFind(tmpTxt,NumberSeq::formattingChars(),1,999);
+        while (x)
+        {
+            formattingChar = subStr(numberSequenceTable.Format, x, 1);
+            switch(formattingChar)
+            {
+                case #SymbolNumerals:
+                    val = 10 * val;
+                    val += str2int(subStr(num, x, 1));
+                    break;
+                case #SymbolLetters:
+                    val = #NoOfLetters * val;
+                    val += char2num(num, x) - char2num(#FirstLetter, 1);
+                    break;
+                default:
+                    return checkFailed(strFmt("@SYS25062",num,numberSequenceTable.Format));
+            }
+            newNum    = strPoke(newNum,formattingChar,x);
+            x = strFind(numberSequenceTable.Format,NumberSeq::formattingChars(),x+1,999);
+        }
+
+        if (newNum != numberSequenceTable.Format)
+            return checkFailed(strFmt("@SYS25062",num,numberSequenceTable.Format));
+
+        if (val <= #NextRecordNull)
+            return checkFailed(strFmt("@SYS25062",num,numberSequenceTable.Format));
+
+        return true;
+    }
+
+    /*
+    public static client server boolean numCheckFormatChangedNumber(Num                    num,
+                                                                    Num                    origNum,
+                                                                    NumberSequenceTable    numbersequenceTable
+                                                                   )
+    {
+        Integer                 intNum,intNumOrig;
+        NumberSequenceFormat    format,formatOrig;
+        ;
+        if (num == origNum)
+            return true;
+
+        if (numbersequenceTable.format)
+        {
+            if (strLen(num) != strLen(numbersequenceTable.format))
+                return checkFailed(strFmt("@SYS25062",num,numbersequenceTable.format));
+
+            [intNum,format]         = NumberSeq::numSplitFormat(num,numbersequenceTable.format);
+
+            if (format != numbersequenceTable.format || intNum <= #NextRecordNull)
+                return checkFailed(strFmt("@SYS25062",num,numbersequenceTable.format));
+
+            [intNumOrig,formatOrig] = NumberSeq::numSplitFormat(origNum,numbersequenceTable.format);
+
+            if (formatOrig != format)
+                return checkFailed(strFmt("@SYS25062",num,numbersequenceTable.format));
+        }
+        else
+        {
+            intNum      = str2Int(num);
+            intNumOrig  = str2Int(origNum);
+        }
+        if (intNum == #NextRecordNull)
+            return checkFailed(strfmt("@SYS70852"));
+
+        if (intNum > numberSequenceTable.Highest)
+            return checkFailed(strfmt("@SYS70849",numberSequenceTable.Highest));
+
+        if (intNum > intNumOrig && !numbersequenceTable.AllowChangeUp)
+            return checkFailed(strfmt("@SYS70850",numbersequencetable.NumberSequence));
+
+        if (intNum < intNumOrig && !numbersequenceTable.AllowChangeDown)
+            return checkFailed(strfmt("@SYS70851",numbersequencetable.NumberSequence));
+
+        return true;
+    }
+    */
+/*
+    AOSRunMode::calledfrom
+    */
+
+    [SysObsolete('Please use numInsertFormatV2 instead', false, 30\6\2020)]
+    public static Num numInsertFormat(Integer num, NumberSequenceFormat   format)
+    {
+        return NumberSeq::numInsertFormatV2(num, format);
+    }
+
+    public static Num numInsertFormatV2(NumberSequence64Range num, NumberSequenceFormat format)
+    {
+        if (format == '')
+            return int642str(num);
+
+        if (!strFind(format, #SymbolLetters, 1, 999))
+            return NumberSeq::numInsertFormatInternal(int642str(num), format);
+
+        return NumberSeq::numInsertFormatLetters(num, format);
+    }
+
+    /*
+    AOSRunMode::calledfrom
+    */
+    private static NumberSequenceFormat numInsertFormatInternal(str num, NumberSequenceFormat format)
+    {
+        Integer         x;
+        str 20          tmpTxt      = format;
+        str 20          tmpNum      = num;
+        Integer         lenNum      = strLen(tmpNum);
+        ;
+        while (tmpNum)
+        {
+            x = strFind(tmpTxt,NumberSeq::formattingChars(),999,-999);
+
+            if (!x)
+            {
+                if (!lenNum)
+                    return tmpNum;
+
+                checkFailed("@SYS55839");
+                throw error(strFmt("@SYS25062",num,format));
+            }
+            tmpTxt  = strPoke(tmpTxt,subStr(tmpNum,lenNum,1),x);
+            tmpNum  = strDel( tmpNum,lenNum,1);
+            lenNum  -= 1;
+        }
+
+        x = strFind(tmpTxt,NumberSeq::formattingChars(),1,999);
+        while (x)
+        {
+            switch (subStr(tmpTxt, x,1))
+            {
+                case #SymbolNumerals:
+                    tmpTxt  = strPoke(tmpTxt,'0',x);
+                    break;
+                case #SymbolLetters:
+                    tmpTxt  = strPoke(tmpTxt, #FirstLetter ,x);
+                    break;
+                default:
+                    checkFailed("@SYS55839");
+                    throw error(strFmt("@SYS25062",num,format));
+            }
+            x = strFind(tmpTxt,NumberSeq::formattingChars(),1,999);
+        }
+
+        return tmpTxt;
+    }
+
+    /* AOSRunMode::calledfrom */
+    private static  NumberSequenceFormat numInsertFormatLetters(NumberSequence64Range num, NumberSequenceFormat   format)
+    {
+        Integer         x, y;
+        Integer         remainder;
+        str             tmpNum = '';
+        str 20          formatSymbolString;
+        Integer         noOfFormatSymbols;
+        NumberSequence64Range processNum;
+        
+        x = strFind(format,NumberSeq::formattingChars(),1,999);
+        while (x)
+        {
+            formatSymbolString += subStr(format,x,1);
+            x = strFind(format,NumberSeq::formattingChars(),x+1,999);
+        }
+        noOfFormatSymbols = strLen(formatSymbolString);
+
+        processNum = num;
+        if (!strFind(formatSymbolString,#SymbolNumerals,1,999))
+            processNum--;    // make 1 = a
+
+        y = 1;
+        while (processNum)
+        {
+            switch (subStr(formatSymbolString, noOfFormatSymbols - y + 1,1))
+            {
+                case #SymbolNumerals:
+                    remainder = int642int(processNum mod 10);
+                    tmpNum = int2str(remainder) + tmpNum;
+                    processNum = processNum / 10;
+                    break;
+                case #SymbolLetters:
+                    remainder = int642int(processNum mod #NoOfLetters);
+                    tmpNum = num2char(remainder + char2num(#FirstLetter, 1)) + tmpNum;
+                    processNum = processNum / #NoOfLetters;
+                    break;
+                default:
+                    checkFailed("@SYS55839");
+                    throw error(strFmt("@SYS25062",num,format));
+            }
+            y++;
+        }
+
+        return NumberSeq::numInsertFormatInternal(tmpNum, format);
+    }
+
+    /*
+    AOSRunMode::calledfrom
+    */
+    [SysObsolete('Please use numRemoveFormatV2 instead', false, 30\6\2020)]
+    public static Integer numRemoveFormat(Num num, NumberSequenceFormat format)
+    {
+        return int642int(NumberSeq::numRemoveFormatV2(num, format));
+    }
+
+    public static NumberSequence64Range numRemoveFormatV2(Num num, NumberSequenceFormat format)
+    {
+        Integer x;
+        NumberSequence64Range val = #NextRecordNull;
+
+        if (!format)
+            return str2int64(num);
+
+        if (strLen(num) != strLen(format))
+            throw error(strFmt("@SYS25062",num,format));
+
+        x = strFind(format,NumberSeq::formattingChars(),1,999);
+        while (x)
+        {
+            switch(subStr(format, x, 1))
+            {
+                case #SymbolNumerals:
+                    val = 10 * val;
+                    val += str2int(subStr(num, x, 1));
+                    break;
+                case #SymbolLetters:
+                    val = #NoOfLetters * val;
+                    val += char2num(num, x) - char2num(#FirstLetter, 1);
+                    break;
+                default:
+                    checkFailed("@SYS55839");
+                    throw error(strFmt("@SYS25062",num,format));
+            }
+            x = strFind(format,NumberSeq::formattingChars(),x+1,999);
+        }
+        if (!strFind(format,#SymbolNumerals,1,999))
+            val++;    // make 1 = a
+        return val;
+    }
+
+    /// <summary>
+    ///    Parses the specified annotated format string into a container of segment information.
+    /// </summary>
+    /// <param name="_annotatedFormat">
+    ///    The annotated format string to parse.
+    /// </param>
+    /// <returns>
+    ///    A container that holds the segment information for the specified annotated format string.
+    /// </returns>
+    /// <remarks>
+    ///    Each segment is a container that contains two elements. The segment information in the resulting
+    ///    container has the following format:
+    ///    <list type="number">
+    ///       <item>
+    ///          <description>
+    ///             The <c>NumberSeqParameterType</c> enumeration value that describes the parameter type.
+    ///          </description>
+    ///       </item>
+    ///       <item>
+    ///          <description>1 for a segment that contains a constant literal value.</description>
+    ///       </item>
+    ///       <item>
+    ///          <description>2 for a segment that contains formatting characters.</description>
+    ///       </item>
+    ///       <item>
+    ///          <description>The type of the value is specific to the parameter type.</description>
+    ///       </item>
+    ///    </list>
+    /// </remarks>
+    public static container parseAnnotatedFormat(str _annotatedFormat)
+    {
+        str segment;
+        int length;
+        int type;
+        str typeStr;
+        str value;
+        int idx;
+        int i = 0;
+
+        container segments;
+
+        do
+        {
+            segment = strLine(_annotatedFormat, i);
+            if (segment)
+            {
+                length = strLen(segment);
+                idx = strFind(segment, #AnnotatedFormatDelimiter, 1, length);
+                typeStr = subStr(segment, 1, idx - 1);
+                type = str2int(typeStr);
+                value = subStr(segment, idx + 1, length - idx);
+
+                segments += [[type, value]];
+            }
+            i++;
+        }
+        while (segment);
+
+        return segments;
+    }
+
+    public static boolean release(
+        NumberSequenceCode  _numberSequenceCode,
+        Num                 _num,
+        NumberSeqScope      _scope = NumberSeqScopeFactory::createDefaultScope())
+    {
+        RefRecId numberSequenceId = NumberSequenceTable::findByNaturalKey(
+            _numberSequenceCode,
+            _scope.getId()).RecId;
+
+
+        return NumberSeq::releaseNumber(numberSequenceId, _num);
+    }
+
+    public static boolean releaseNumber(RefRecId _numberSequenceid, Num _num)
+    {
+        #OCCRetryCount
+
+        NumberSequenceList      numberSequenceList;
+        NumberSequenceTTS       numberSequenceTTS;
+        NumberSequenceTable     numberSequenceTable;
+        xSession                xSession;
+        boolean                 ok = true;
+        NumberSequence64Range   nextRecord;
+        createdTransactionId    transId;
+        int                     retryCount = 0;
+        
+        boolean nonBlockingNumberSequenceFlagEnabledToUse = NumberSeq::getNonBlockingNumberSequenceFlag();
+
+        using (NumberSequenceConnection userConnection = NumberSequenceConnection::newEnsureDisposedBeforeTTSFinalization())
+        {
+            userConnection.tts_begin();
+
+            userConnection.setConnection(numberSequenceList);
+            userConnection.setConnection(numberSequenceTable);
+
+            if (nonBlockingNumberSequenceFlagEnabledToUse)
+            {
+                select firstonly numberSequenceTable
+                where numberSequenceTable.RecId == _numberSequenceId;
+            }
+            else
+            {
+                select forupdate firstonly numberSequenceTable
+                where numberSequenceTable.RecId == _numberSequenceId;
+            }
+
+            if (!numberSequenceTable)
+                throw error(strfmt("@SYS26271",_numberSequenceId));
+
+            if (!numberSequenceTable.checkBlocked())
+                throw error("@SYS18447");
+
+            if (numberSequenceTable.Continuous == NoYes::No)
+                ok = true;
+            else
+            {
+                if (numbersequencetable.Extended)
+                {
+                    nextRecord = NumberSeq::numRemoveFormatV2(_num, numbersequencetable.Format);
+                }
+                else
+                {
+                    nextRecord = NumberSeq::numRemoveFormat(_num, numbersequencetable.Format);
+                }
+
+                try
+                {
+                    select forupdate firstonly numberSequenceList
+                    where numberSequenceList.NumberSequenceId == _numberSequenceId
+                          && (numberSequenceList.NextRec == nextRecord || numberSequenceList.NextRec64 == nextRecord);
+
+                    if (numberSequenceList.RecId)
+                    {
+                        if (numberSequenceList.Status == NumStatus::Free)
+                        {
+                            ok = true;
+                        }
+                        else if (numberSequenceList.Status == NumStatus::Active || numberSequenceList.Status == NumStatus::Reserved || numberSequenceList.Status == NumStatus::ActiveNonBlocking)
+                        {
+                            // Preserve values to log in telemetry
+                            var numberSequenceListId = numbersequenceList.RecId;
+                            var sessionId = numberSequenceList.SessionId;
+                            var sessionLoginDateTime = numberSequenceList.SessionLoginDateTime;
+                            var previousStatus = numberSequenceList.Status;
+
+                            if (numberSequenceList.TransId)
+                            {
+                                transId = numberSequenceList.TransId;
+
+                                numberSequenceList.Status   = NumStatus::Free;
+                                numberSequenceList.TransId  = 0;
+                                numberSequenceList.SessionId = 0;
+                                numberSequenceList.UserId = null;
+                                numberSequenceList.SessionLoginDateTime = DateTimeUtil::minValue();
+                                numberSequenceList.update();
+
+                                select forupdate firstonly numberSequenceTTS
+                                where numberSequenceTTS.TransId == transId;
+
+                                if (numberSequenceTTS.RecId)
+                                    numberSequenceTTS.delete();
+
+                                ok = true;
+                            }
+                            else
+                            {
+                                xSession = new xSession(sessionid());
+
+                                if (numberSequenceList.SessionId == sessionid() &&
+                                    numberSequenceList.SessionLoginDateTime == xSession.loginDateTime())
+                                {
+                                    numberSequenceList.Status   = NumStatus::Free;
+                                    numberSequenceList.TransId  = 0;
+                                    numberSequenceList.SessionId = 0;
+                                    numberSequenceList.UserId = null;
+                                    numberSequenceList.SessionLoginDateTime = DateTimeUtil::minValue();
+                                    numberSequenceList.update();
+                                    ok = true;
+                                }
+                                else
+                                {
+                                    if (NumberSeqCleanUp::isProcessDead(numberSequenceList))
+                                    {
+                                        numberSequenceList.Status   = NumStatus::Free;
+                                        numberSequenceList.TransId  = 0;
+                                    numberSequenceList.SessionId = 0;
+                                    numberSequenceList.UserId = null;
+                                    numberSequenceList.SessionLoginDateTime = DateTimeUtil::minValue();
+                                        numberSequenceList.update();
+                                        ok = true;
+                                    }
+                                    else
+                                    {
+                                        ok = false;
+                                    }
+
+                                }
+                            }
+                            if (ok)
+                            {
+                                NumberSeqInstrumentationHelper::emitReleaseNumber(
+                                    _numberSequenceId,
+                                    numberSequenceListId,
+                                    sessionId,
+                                    sessionLoginDateTime,
+                                    nextRecord,
+                                    previousStatus);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        numberSequenceList.NumberSequenceId  = _numberSequenceId;
+                        numberSequenceList.TransId           = 0;
+                        numberSequenceList.SessionId = 0;
+                        numberSequenceList.UserId = null;
+                        numberSequenceList.SessionLoginDateTime = DateTimeUtil::minValue();
+                        numberSequenceList.Status            = NumStatus::Free;
+                        if (numberSequenceTable.Extended)
+                        {
+                            numberSequenceList.NextRec64 = nextRecord;
+                        }
+                        else
+                        {
+                            numberSequenceList.NextRec = int642int(nextRecord);
+                        }
+                        numberSequenceList.insert();
+                        ok = true;
+                    }
+                }
+                catch(Exception::UpdateConflict)
+                {
+                    retryCount++;
+                    if (retryCount >= #RetryNum)
+                    {
+                        userConnection.tts_abort();
+                        userConnection.finalize();
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+            }
+
+            if(nonBlockingNumberSequenceFlagEnabledToUse && FlightingHelper::IsFlightEnabled("EnableNonBlockingAbort"))
+            {
+                NumberSeqMessage numberSeqMessage;
+                userConnection.setConnection(numberSeqMessage);
+
+                while select forupdate numberSeqMessage
+                  where numberSeqMessage.NumberSeqId == _numberSequenceId && numberSeqMessage.NextRec == nextRecord
+                {
+                    numberSeqMessage.delete();
+                }
+            }
+
+            userConnection.tts_commit();
+        }
+
+        return ok;
+    }
+
+    /// <summary>
+    /// Informs the number sequence engine that the record that needed a number is now saved.
+    /// </summary>
+    /// <param name = "_actualUsedNumber">The actual number that was used.</param>
+    /// <param name = "_numberFromSequence">The number from the number sequence that was suggested to be used.</param>
+    public void onNumberUsed(Num _actualUsedNumber, Num _numberFromSequence)
+    {
+        if (_numberFromSequence && _numberFromSequence == lastNumGenerated)
+        {
+            if (_numberFromSequence == _actualUsedNumber)
+            {
+                this.used();
+            }
+            else
+            {
+                this.abort();
+
+                if (numTableNum.Continuous)
+                {
+                    NumberSeq::newReserveNumFromId(numTableNum.RecId, false, true).reserve(_actualUsedNumber);
+                }
+            }
+        }
+    }
+
+}
